@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ds-script-agent"
+name = "data-sql-guardian"
 version = "0.1.0"
-description = "Data Script Agent for SQL/ETL chunking, single/project optimization, and pre-release change gate"
+description = "Data SQL Guardian: whole-project SQL chunking, optimization, and pre-release change gate"
 requires-python = ">=3.9"
 dependencies = [
   "fastapi>=0.115,<1",

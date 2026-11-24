@@ -149,7 +149,7 @@ export default function WorkspacePage() {
         />
         {error && <div className="alert alert-error">{error}</div>}
         <EmptyState
-          title="欢迎使用 DS Agent SQL 工程治理工作台"
+          title="欢迎使用 Data SQL Guardian SQL 工程治理工作台"
           description="您可以一键导入内置 25 个真实 SAC Oracle ETL 跑批脚本进行体验，或导入本地目录 / ZIP 仓库开展全量代码剖析、全局优化与上线前门禁评估。"
           primaryLabel="一键导入真实 SAC 样本库"
           onPrimary={handleQuickSac}

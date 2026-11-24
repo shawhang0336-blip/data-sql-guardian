@@ -1,6 +1,6 @@
-# DS Agent 前端架构说明
+# Data SQL Guardian 前端架构说明
 
-对齐后端四域 API（`platform` / `workspace` / `analysis` / `review`），采用与 `dq_agent` 一致的**横向工作台导航壳 + GitHub-Light 阅读级代码块 + 主从左右分栏（Master-Detail）+ 分页筛选器**设计，严格保持 8 目录结构与零 `/api/` 泄漏约束（由 `tests/frontend_audit.test.mjs` 守护）。
+对齐后端四域 API（`platform` / `workspace` / `analysis` / `review`），采用与 `data-rule-studio` 一致的**横向工作台导航壳 + GitHub-Light 阅读级代码块 + 主从左右分栏（Master-Detail）+ 分页筛选器**设计，严格保持 8 目录结构与零 `/api/` 泄漏约束（由 `tests/frontend_audit.test.mjs` 守护）。
 
 ## 1. 目录职责（`src/` 仅允许以下 8 个目录）
 

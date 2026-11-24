@@ -1,4 +1,6 @@
-# DS Agent（Data Script Agent）
+# Data SQL Guardian（`data-sql-guardian`）
+
+> **统一 Data Agent 产品家族**：[`data-rule-studio`](https://github.com/shawhang0336-blip/data-rule-studio)（规则装配与验证） · [`data-biz-copilot`](https://github.com/shawhang0336-blip/data-biz-copilot)（业务资产与制度对账） · [`data-sql-guardian`](https://github.com/shawhang0336-blip/data-sql-guardian)（SQL 优化与发布门禁）
 
 面向金融与数仓 ETL SQL / Oracle PL-SQL 项目的**整仓切片解析、单脚本诊断重写、全局架构优化与上线前变更门禁**智能工程治理台。
 

@@ -22,8 +22,8 @@ DEFAULT_BUDGET: Dict[str, int] = {
 
 
 class Settings(BaseSettings):
-    app_name: str = "Data Script Agent — SQL 工程治理、优化与上线评估台"
-    database_url: str = f"sqlite:///{ROOT_DIR / 'backend' / 'var' / 'ds_agent.db'}"
+    app_name: str = "Data SQL Guardian — SQL 治理优化与发布门禁台"
+    database_url: str = f"sqlite:///{ROOT_DIR / 'backend' / 'var' / 'data_sql_guardian.db'}"
     blob_dir: str = str(ROOT_DIR / "backend" / "var" / "blobs")
     sql_explorer_dir: Optional[str] = None
     llm_provider: str = "scripted"

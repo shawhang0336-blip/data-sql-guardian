@@ -46,8 +46,8 @@ function WorkbenchShell() {
         <NavLink to="/" className="workbench-brand">
           <span className="workbench-brand-mark"><BrandMark /></span>
           <span className="workbench-brand-text">
-            <span className="workbench-brand-title">DS Agent</span>
-            <span className="workbench-brand-sub">SQL 工程治理工作台</span>
+            <span className="workbench-brand-title">Data SQL Guardian</span>
+            <span className="workbench-brand-sub">SQL 治理优化与发布门禁台</span>
           </span>
         </NavLink>
 
