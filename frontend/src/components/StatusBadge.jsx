@@ -9,5 +9,10 @@ export function StatusBadge({ kind, value }) {
         ? VERDICT_META
         : STATUS_META
   const meta = dict[value] || { label: value || '—', badgeClass: 'badge-neutral' }
-  return <span className={`badge ${meta.badgeClass}`}>{meta.label}</span>
+  return (
+    <span className={`badge ${meta.badgeClass}`}>
+      <span className="badge-dot" aria-hidden="true" />
+      {meta.label}
+    </span>
+  )
 }

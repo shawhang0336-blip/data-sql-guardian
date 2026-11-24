@@ -26,3 +26,30 @@ export function formatUtcTime(iso) {
   if (Number.isNaN(d.getTime())) return iso
   return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
 }
+
+export function paginateItems(items, page = 1, pageSize = 20) {
+  const list = Array.isArray(items) ? items : []
+  const size = Math.max(1, Number(pageSize) || 20)
+  const totalPages = Math.max(1, Math.ceil(list.length / size))
+  const safePage = Math.min(Math.max(1, Number(page) || 1), totalPages)
+  const start = (safePage - 1) * size
+  return {
+    items: list.slice(start, start + size),
+    page: safePage,
+    pageSize: size,
+    total: list.length,
+    totalPages,
+  }
+}
+
+export function groupFindingsBySeverity(findings) {
+  const counts = { P0: 0, P1: 0, P2: 0, resolved: 0, total: 0 }
+  for (const f of findings || []) {
+    counts.total += 1
+    if (f?.severity === 'P0') counts.P0 += 1
+    else if (f?.severity === 'P1') counts.P1 += 1
+    else counts.P2 += 1
+    if (f?.status && f.status !== 'OPEN') counts.resolved += 1
+  }
+  return counts
+}

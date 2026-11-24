@@ -5,7 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { ApiError, api, formatApiErrorDetail } from '../src/api/client.js'
-import { formatUtcTime } from '../src/utils/labels.js'
+import { formatUtcTime, groupFindingsBySeverity, paginateItems } from '../src/utils/labels.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SRC_DIR = path.resolve(__dirname, '../src')
@@ -68,8 +68,19 @@ test('ApiError formats FastAPI 422 arrays and non-JSON 502 cleanly', async () =>
   }
 })
 
-test('formatUtcTime converts naive backend UTC timestamps to Asia/Shanghai consistently', () => {
+test('formatUtcTime, paginateItems, and groupFindingsBySeverity behave accurately', () => {
   assert.equal(formatUtcTime(''), '—')
   const rendered = formatUtcTime('2026-11-24T02:00:00')
   assert.match(rendered, /10:00:00/)
+
+  const paged = paginateItems(Array.from({ length: 45 }, (_, i) => i + 1), 3, 20)
+  assert.equal(paged.totalPages, 3)
+  assert.deepEqual(paged.items, [41, 42, 43, 44, 45])
+
+  const counts = groupFindingsBySeverity([
+    { severity: 'P0', status: 'OPEN' },
+    { severity: 'P1', status: 'ADOPTED' },
+    { severity: 'P2', status: 'IGNORED' },
+  ])
+  assert.deepEqual(counts, { P0: 1, P1: 1, P2: 1, resolved: 2, total: 3 })
 })
