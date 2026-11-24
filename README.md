@@ -37,7 +37,7 @@
 
 - 导入 `25` 个 SAC Oracle SQL 脚本（16,274 行），精准切分 `1,651` 个语句切块与 `183` 张 DDL 数据表。
 - 剔除 DDL 定义噪声后提取 `173` 条跨脚本 ETL 依赖边（含 `8` 组真写冲突与 `32` 组 `TRUNCATE` 冲突），精准命中 `SP_SAC_ACCT_AMOUNT.sql` 的 `NULL` 谓词逻辑死锁（`S001`）、`REPLACE` 连接（`S006`）与重复写入同表（`S013`），以及 `SP_SAC_LARGE_BULU.sql` 的函数包裹 JOIN（`S006`）、`LIKE '%购汇%'`（`S008`）、`SYS_GUID()`（`S010`）与 `SYSDATE` 时段分支（`S015`）。
-- 全量测试通过：`17` 项后端 pytest（`-W error::sqlalchemy.exc.SAWarning` 零警告）+ `4` 项前端审计测试及生产构建。
+- 全量测试通过：`17` 项后端 pytest（`-W error::sqlalchemy.exc.SAWarning` 零警告）+ `5` 项前端审计测试及生产构建。
 
 ## 环境配置与快速启动
 
