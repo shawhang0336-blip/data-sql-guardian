@@ -3,6 +3,7 @@ import { PageHeader } from '../../components/PageHeader.jsx'
 import { StatusBadge } from '../../components/StatusBadge.jsx'
 import { CodeBlock } from '../../components/CodeBlock.jsx'
 import { EmptyState } from '../../components/EmptyState.jsx'
+import { RoadmapView } from '../../components/RoadmapView.jsx'
 import { useProjectContext } from '../../context/ProjectContext.jsx'
 import { useAsync } from '../../hooks/useAsync.js'
 import { groupFindingsBySeverity, paginateItems } from '../../utils/labels.js'
@@ -15,7 +16,7 @@ import {
 } from '../../api/analysis.js'
 
 export default function AnalysisPage() {
-  const { selectedProjectId, refreshProjects, setImportModalOpen, pushToast } = useProjectContext()
+  const { projects, selectedProjectId, refreshProjects, setImportModalOpen, pushToast } = useProjectContext()
   const { busy, error, setError, run } = useAsync()
 
   const [tab, setTab] = useState('findings') // findings | scripts | roadmap
@@ -371,39 +372,23 @@ export default function AnalysisPage() {
       )}
 
       {tab === 'roadmap' && (
-        <div className="card">
-          {!roadmap?.executive_summary ? (
-            <EmptyState
-              title="尚未生成 AI 全项目架构重构路线图"
-              description="结合跨脚本血缘、写表冲突与高频热点表，由 AI 统一梳理分阶段重构建议与公共层抽取方案。"
-              primaryLabel={busy ? '合成中...' : '立即运行 AI 全仓架构合成'}
-              onPrimary={() => handleAnalyzeProject(true)}
-            />
-          ) : (
-            <div>
-              <h3 className="card-title">全仓总体架构评估与治理策略</h3>
-              <div className="info-callout" style={{ marginBottom: 16 }}>
-                {roadmap.executive_summary}
-              </div>
-              {(roadmap.architecture_recommendations || []).map((rec, idx) => (
-                <div key={idx} className="finding-row" style={{ padding: 16 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
-                    <span className="badge badge-info">{rec.priority}</span>
-                    <span className="badge badge-neutral">{rec.category}</span>
-                    <strong>{rec.title}</strong>
-                  </div>
-                  <p style={{ margin: '0 0 8px' }}>{rec.proposal}</p>
-                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 12.5, color: '#15803d' }}>
-                    <span>预期收益：{rec.expected_benefit}</span>
-                    {(rec.affected_tables || []).map((t) => (
-                      <code key={t} style={{ background: '#f3f4f6', padding: '1px 6px', borderRadius: 4, color: '#1f2937' }}>{t}</code>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        <RoadmapView
+          roadmap={roadmap}
+          projectName={projects.find((p) => p.id === selectedProjectId)?.name || 'SQL 项目'}
+          busy={busy}
+          onRegenerate={() => handleAnalyzeProject(true)}
+          onSelectScriptName={(filename) => {
+            const matched = scripts.find((s) => s.filename === filename)
+            if (matched) {
+              setScriptFilter(matched.id)
+              setScopeFilter('SCRIPT')
+            } else {
+              setSearchText(filename)
+            }
+            setPage(1)
+            setTab('findings')
+          }}
+        />
       )}
     </div>
   )
