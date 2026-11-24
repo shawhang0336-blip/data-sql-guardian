@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ds-script-agent"
+version = "0.1.0"
+description = "Data Script Agent for SQL/ETL chunking, single/project optimization, and pre-release change gate"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "uvicorn>=0.30,<1",
+  "SQLAlchemy>=2.0,<2.1",
+  "pydantic-settings>=2.5,<3",
+  "httpx>=0.27,<1",
+  "python-multipart>=0.0.9,<1",
+  "json-repair>=0.30,<1",
+  "sqlglot>=25.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+markers = [
+  "smoke: live LLM smoke test against SAC corpus (skipped unless RUN_REAL_SMOKE=1)",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
