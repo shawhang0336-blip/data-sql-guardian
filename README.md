@@ -25,7 +25,7 @@
 
 2. **单脚本优化（16 条确定性规则 + AI 根因诊断 & SQL 重写）**
    - `S001`–`S016` 纯离线静态规则覆盖：`NULL` 等值子查询死锁（`S001`）、无 `WHERE` 改删（`S002`）、`NOT IN` 空值陷阱（`S003`）、缺 `EXCEPTION` 回滚块（`S004`）、`TRUNCATE` 混用多点 `COMMIT`（`S005`）、`JOIN` / `WHERE` 列包裹函数（`S006`/`S007`）、前导通配符 `LIKE`（`S008`）、无列名 `INSERT`（`S009`）、`SYS_GUID()` 非确定主键（`S010`）、隐式笛卡尔积（`S011`）、动态 SQL 风险（`S012`）、单脚本反复写入同表（`S013`）、`SELECT *`（`S014`）、运行时 `SYSDATE` 分支（`S015`）及 `DISTINCT` / 非 `ALL` `UNION`（`S016`）。
-   - 受控 AI 介入：先运行 `plan_script_review` 精选高优切块，再以 BSP 并行波次调用 `diagnose_chunk_issues` 与 `propose_sql_rewrite`，经 `ds_bus` + `sqlglot` 语法与目标表门禁校验后入库。
+   - 受控 AI 介入：基于 `PROJECT_ANALYSIS_PLAN` 与 `Scheduler` 先运行 `plan_script_review` 精选高优切块，再以 BSP `Send` 并行波次调用 `diagnose_chunk_issues` 与 `propose_sql_rewrite`，经 `ds_bus` + `sqlglot` 语法与目标表门禁校验并归并 `chunk_diagnostics` 通道后入库。
 
 3. **全项目全局优化（6 条确定性规则 + AI 架构重构路线图）**
    - `P001` 跨脚本并发写 / `TRUNCATE` 冲突、`P002` 血缘环路依赖、`P003` 跨脚本重复逻辑簇、`P004` 过长串行关键路径、`P005` 高扇入/出枢纽表瓶颈、`P006` 孤儿中间表与缺失 DDL 资产。
@@ -34,7 +34,7 @@
 4. **上线前变更评估与发布门禁（Pre-Release Gate）**
    - 支持提交 `ADD` 新增脚本或 `MODIFY` 基线脚本修改，计算 Unified Diff + AST 增量差异 + 临时模拟拓扑中的多跳下游 **Blast Radius（爆破半径）**。
    - 确定性裁决红线：`PASS` / `WARN` / `BLOCK`（新增 P0、移除 `EXCEPTION`、新 `TRUNCATE`/写冲突或血缘环路强制 `BLOCK`），并挂载 `release_gate_floor_adjudicator` 禁止 AI 降级硬红线。
-   - 通过 ProdAgent `Interrupt` 协议挂起等待人工审批；批准上线后自动合并入项目基线、`ScriptRevisionModel` 版本递增并重建全仓血缘；支持导出 Markdown 报告与查看防篡改 SHA-256 事件溯源链。
+   - 通过 `CHANGE_REVIEW_PLAN` + `Scheduler` + ProdAgent `Interrupt` 协议在 `release_approval_gate` 挂起等待人工审批，并支持通道恢复与 `Scheduler.resume`；批准上线后自动合并入项目基线、`ScriptRevisionModel` 版本递增并重建全仓血缘；支持导出 Markdown 报告与查看防篡改 SHA-256 事件溯源链。
 
 ---
 
@@ -47,13 +47,13 @@ data-sql-guardian/
 │   │   ├── main.py                   # FastAPI 装配入口（lifespan / CORS / 路由注册）
 │   │   ├── infra/                    # 基础设施层：SQLite/ORM 表、BlobStore、受控 LLM 客户端与 Schema
 │   │   ├── kernel/                   # ProdAgent 微内核（Bus / EventLog / Interrupt / Plan / Run / Scheduler）
-│   │   ├── policy/                   # 治理门禁策略（ds_bus / ds_channels / ds_plan）
+│   │   ├── policy/                   # 治理门禁策略与工作流上下文（ds_bus / ds_channels / ds_plan）
 │   │   ├── ingestion/                # ZIP/目录导入、方言切块（dialect_chunker）、DDL 与 AST 解析
 │   │   ├── catalog/                  # 项目基线服务、跨脚本血缘图（lineage_graph）与 Diff 引擎
-│   │   ├── analysis/                 # 确定性规则（script_rules / project_rules）与单脚本/全局分析工作流
-│   │   ├── review/                   # 变更评估与发布门禁（change_evaluator）
+│   │   ├── analysis/                 # 确定性规则（script_rules / project_rules）与 Scheduler 单脚本/全局分析工作流
+│   │   ├── review/                   # 基于 CHANGE_REVIEW_PLAN 的变更评估与发布门禁（change_evaluator）
 │   │   └── api/                      # 四域薄路由与服务（workspace / analysis / review / platform）
-│   └── tests/                        # 17 项后端 pytest（AST 架构隔离 + SAC 语料 + 变更门禁 + E2E）
+│   └── tests/                        # 19 项后端 pytest（AST 架构隔离 + SAC 语料 + Scheduler/Interrupt 变更门禁 + E2E）
 ├── frontend/
 │   ├── src/
 │   │   ├── app/                      # App.jsx（三步横向工作台壳层与路由）
@@ -85,7 +85,7 @@ data-sql-guardian/
 
 - 导入 `25` 个 SAC Oracle SQL 脚本（16,274 行），精准切分 `1,651` 个语句切块与 `183` 张 DDL 数据表。
 - 剔除 DDL 定义噪声后提取 `173` 条跨脚本 ETL 依赖边（含 `8` 组真写冲突与 `32` 组 `TRUNCATE` 冲突），精准命中 `SP_SAC_ACCT_AMOUNT.sql` 的 `NULL` 谓词逻辑死锁（`S001`）、`REPLACE` 连接（`S006`）与重复写入同表（`S013`），以及 `SP_SAC_LARGE_BULU.sql` 的函数包裹 JOIN（`S006`）、`LIKE '%购汇%'`（`S008`）、`SYS_GUID()`（`S010`）与 `SYSDATE` 时段分支（`S015`）。
-- 全量测试通过：`17` 项后端 pytest（`-W error::sqlalchemy.exc.SAWarning` 零警告）+ `5` 项前端审计测试及生产构建。
+- 全量测试通过：`19` 项后端 pytest（`-W error::sqlalchemy.exc.SAWarning` 零警告）+ `5` 项前端审计测试及生产构建。
 
 ---
 
@@ -111,7 +111,7 @@ npm run dev
 ## 测试命令
 
 ```bash
-# 后端全量测试（17 项：8 层 DAG/纯度检查 + SAC 真实语料 + 变更门禁 + 四域 API E2E）
+# 后端全量测试（19 项：8 层 DAG/纯度检查 + SAC 真实语料 + Scheduler/Interrupt 变更门禁 + 四域 API E2E）
 cd backend && pytest -v -W error::sqlalchemy.exc.SAWarning
 
 # 前端目录/API 隔离审计与生产构建（5 项审计测试 + Vite 构建）

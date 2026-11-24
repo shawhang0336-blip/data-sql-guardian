@@ -1,10 +1,10 @@
-"""Pre-release change evaluation engine: AST Diff, blast radius simulation, deterministic gate, guarded AI review, and Interrupt suspension."""
+"""Pre-release change evaluation engine: AST Diff, blast radius simulation, deterministic gate, guarded AI review, and Interrupt suspension via Scheduler."""
 
 from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -16,7 +16,7 @@ from app.catalog import (
     load_script_raw_text,
 )
 from app.infra.blob_store import blob_store
-from app.infra.config import OPERATOR_PLACEHOLDER, get_budget, get_effective_settings
+from app.infra.config import OPERATOR_PLACEHOLDER, get_budget, get_effective_settings, get_settings
 from app.infra.db_tables import (
     ChangeReviewModel,
     ScriptChunkModel,
@@ -26,9 +26,14 @@ from app.infra.db_tables import (
 )
 from app.infra.errors import ProviderAuthOrBillingError
 from app.infra.llm import RealDesignLlm, call_llm_validated, llm_execution_scope
-from app.ingestion import aggregate_script_features, analyze_chunk_ast
-from app.kernel import append_event, create_run, make_interrupt_payload
-from app.policy import build_run_bus
+from app.ingestion import aggregate_script_features
+from app.kernel import Outcome, Scheduler, create_run
+from app.policy import (
+    CHANGE_REVIEW_PLAN,
+    build_change_review_context,
+    build_run_bus,
+    default_bus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +60,7 @@ def evaluate_script_change(
     run_llm: bool = False,
     llm_client: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Evaluate a proposed `ADD` or `MODIFY` script change and pause on human approval Interrupt."""
+    """Evaluate a proposed `ADD` or `MODIFY` script change via `CHANGE_REVIEW_PLAN` and pause on Interrupt."""
     project = session.get(ScriptProjectModel, project_id)
     if project is None:
         raise ValueError(f"未找到项目: {project_id}")
@@ -104,205 +109,6 @@ def evaluate_script_change(
         filename=filename,
     )
 
-    diff = compute_script_ast_diff(
-        old_sql,
-        new_content,
-        filename=filename,
-        dialect=dialect or "oracle",
-    )
-    new_parsed = diff["new_parsed_script"]
-    new_feats = diff["new_chunk_features"]
-    new_agg = aggregate_script_features(new_feats)
-
-    candidate_script_id = target_script.id if target_script is not None else f"candidate:{review_id}"
-    candidate_script_dict = {
-        "id": candidate_script_id,
-        "filename": filename,
-        "relative_path": relative_path,
-        "file_kind": new_parsed.file_kind,
-        "target_tables": new_agg["target_tables"],
-        "source_tables": new_agg["source_tables"],
-        "commit_count": new_parsed.commit_count,
-        "has_exception_handler": new_parsed.has_exception_handler,
-    }
-    candidate_chunks_dicts = [
-        {
-            "id": f"cand_chunk_{idx}",
-            "script_id": candidate_script_id,
-            "chunk_index": ch.chunk_index,
-            "start_line": ch.start_line,
-            "end_line": ch.end_line,
-            "statement_kind": ch.statement_kind,
-            "is_dynamic_sql": ch.is_dynamic_sql,
-            "control_context": ch.control_context,
-            "target_tables": feat.target_tables,
-            "source_tables": feat.source_tables,
-            "ast_features": feat.to_dict(),
-            "ast_fingerprint": feat.ast_fingerprint,
-            "raw_sql": ch.raw_sql,
-        }
-        for idx, (ch, feat) in enumerate(zip(new_parsed.chunks, new_feats))
-    ]
-
-    candidate_findings = evaluate_script_rules(candidate_script_dict, candidate_chunks_dicts)
-
-    # Compare baseline findings if MODIFY to highlight incremental findings
-    baseline_finding_sigs = set()
-    if target_script is not None:
-        base_chunks = (
-            session.query(ScriptChunkModel)
-            .filter(ScriptChunkModel.script_id == target_script.id)
-            .all()
-        )
-        base_findings = evaluate_script_rules(
-            {
-                "id": target_script.id,
-                "filename": target_script.filename,
-                "file_kind": target_script.file_kind,
-                "target_tables": target_script.target_tables_json or [],
-                "source_tables": target_script.source_tables_json or [],
-                "commit_count": target_script.commit_count,
-                "has_exception_handler": target_script.has_exception_handler,
-            },
-            [
-                {
-                    "id": c.id,
-                    "chunk_index": c.chunk_index,
-                    "start_line": c.start_line,
-                    "end_line": c.end_line,
-                    "statement_kind": c.statement_kind,
-                    "is_dynamic_sql": c.is_dynamic_sql,
-                    "control_context": c.control_context,
-                    "target_tables": c.target_tables_json or [],
-                    "source_tables": c.source_tables_json or [],
-                    "ast_features": c.ast_features_json or {},
-                    "ast_fingerprint": c.ast_fingerprint,
-                    "raw_sql": c.raw_sql,
-                }
-                for c in base_chunks
-            ],
-        )
-        baseline_finding_sigs = {(bf["rule_code"], bf["evidence_snippet"][:120]) for bf in base_findings}
-
-    new_findings: List[Dict[str, Any]] = []
-    for cf in candidate_findings:
-        sig = (cf["rule_code"], cf["evidence_snippet"][:120])
-        is_new = sig not in baseline_finding_sigs
-        item = dict(cf)
-        item["is_incremental"] = is_new
-        if ctype == "ADD" or is_new or cf["severity"] == "P0":
-            new_findings.append(item)
-
-    # Simulate project topology WITH candidate change to trace downstream blast radius & new cycles/conflicts
-    existing_scripts = session.query(ScriptFileModel).filter(ScriptFileModel.project_id == project_id).all()
-    existing_chunks = session.query(ScriptChunkModel).filter(ScriptChunkModel.project_id == project_id).all()
-    existing_schemas = session.query(TableSchemaModel).filter(TableSchemaModel.project_id == project_id).all()
-
-    base_script_dicts = [
-        {
-            "id": s.id,
-            "filename": s.filename,
-            "relative_path": s.relative_path,
-            "file_kind": s.file_kind,
-            "target_tables": s.target_tables_json or [],
-            "source_tables": s.source_tables_json or [],
-        }
-        for s in existing_scripts
-    ]
-    base_chunk_dicts = [
-        {
-            "id": c.id,
-            "script_id": c.script_id,
-            "start_line": c.start_line,
-            "end_line": c.end_line,
-            "statement_kind": c.statement_kind,
-            "target_tables": c.target_tables_json or [],
-            "source_tables": c.source_tables_json or [],
-            "ast_features": c.ast_features_json or {},
-            "ast_fingerprint": c.ast_fingerprint,
-            "raw_sql": c.raw_sql,
-        }
-        for c in existing_chunks
-    ]
-    schema_dicts = [{"table_name": sc.table_name} for sc in existing_schemas]
-
-    base_topology = build_lineage_topology(base_script_dicts, base_chunk_dicts, schema_dicts)
-
-    sim_scripts = [s for s in base_script_dicts if s["id"] != candidate_script_id] + [candidate_script_dict]
-    sim_chunks = [c for c in base_chunk_dicts if c["script_id"] != candidate_script_id] + candidate_chunks_dicts
-    sim_topology = build_lineage_topology(sim_scripts, sim_chunks, schema_dicts)
-
-    blast_radius = compute_blast_radius(candidate_script_id, sim_topology)
-
-    # Compute newly introduced topology hazards
-    base_wc_tables = {wc["table"] for wc in base_topology.get("write_conflict_tables", [])}
-    sim_wc_tables = {wc["table"] for wc in sim_topology.get("write_conflict_tables", [])}
-    new_write_conflicts = sorted(sim_wc_tables - base_wc_tables)
-
-    base_tc_tables = {tc["table"] for tc in base_topology.get("truncate_conflicts", [])}
-    sim_tc_tables = {tc["table"] for tc in sim_topology.get("truncate_conflicts", [])}
-    new_truncate_conflicts = sorted(sim_tc_tables - base_tc_tables)
-
-    base_cycles = {tuple(c) for c in base_topology.get("cycles", [])}
-    sim_cycles = [c for c in sim_topology.get("cycles", []) if tuple(c) not in base_cycles]
-
-    blast_radius["new_write_conflict_tables"] = new_write_conflicts
-    blast_radius["new_truncate_conflict_tables"] = new_truncate_conflicts
-    blast_radius["new_cycles"] = sim_cycles
-
-    # Deterministic verdict adjudication
-    block_reasons: List[str] = []
-    warn_reasons: List[str] = []
-
-    p0_findings = [f for f in new_findings if f["severity"] == "P0" and (ctype == "ADD" or f["is_incremental"])]
-    p1_findings = [f for f in new_findings if f["severity"] == "P1" and (ctype == "ADD" or f["is_incremental"])]
-
-    if p0_findings:
-        block_reasons.append(f"新增或命中 P0 阻断级缺陷 ({', '.join(sorted({f['rule_code'] for f in p0_findings}))})")
-    if diff["exception_handler_removed"]:
-        block_reasons.append("修改后移除了原有 EXCEPTION 异常处理保护块")
-    if new_truncate_conflicts:
-        block_reasons.append(f"触发新的跨脚本 TRUNCATE 并发读取冲突 ({', '.join(new_truncate_conflicts)})")
-    if new_write_conflicts:
-        block_reasons.append(f"新增主表多脚本并发写冲突 ({', '.join(new_write_conflicts)})")
-    if sim_cycles:
-        block_reasons.append("引入新的全项目血缘环形依赖 (DAG Cycle)")
-
-    if p1_findings:
-        warn_reasons.append(f"新增 P1 性能/规范隐患 ({', '.join(sorted({f['rule_code'] for f in p1_findings}))})")
-    if blast_radius["total_impacted_scripts"] >= 1:
-        warn_reasons.append(
-            f"下游影响波及 {blast_radius['total_impacted_scripts']} 个脚本（最深 {blast_radius['max_hop']} 跳）"
-        )
-    if diff["removed_target_tables"]:
-        warn_reasons.append(f"修改移除了原有目标表写入：{', '.join(diff['removed_target_tables'])}")
-
-    if block_reasons:
-        det_verdict = "BLOCK"
-    elif warn_reasons:
-        det_verdict = "WARN"
-    else:
-        det_verdict = "PASS"
-
-    diff_summary_json = {
-        "unified_diff": diff["unified_diff"],
-        "added_lines": diff["added_lines"],
-        "removed_lines": diff["removed_lines"],
-        "old_line_count": diff["old_line_count"],
-        "new_line_count": diff["new_line_count"],
-        "old_chunk_count": diff["old_chunk_count"],
-        "new_chunk_count": diff["new_chunk_count"],
-        "added_target_tables": diff["added_target_tables"],
-        "removed_target_tables": diff["removed_target_tables"],
-        "added_source_tables": diff["added_source_tables"],
-        "removed_source_tables": diff["removed_source_tables"],
-        "added_chunks": diff["added_chunks"],
-        "removed_chunks": diff["removed_chunks"],
-        "exception_handler_removed": diff["exception_handler_removed"],
-        "block_reasons": block_reasons,
-        "warn_reasons": warn_reasons,
-    }
-
     run = create_run(
         session,
         spec_id=f"review:{filename}",
@@ -314,41 +120,291 @@ def evaluate_script_change(
             "change_type": ctype,
         },
     )
-    append_event(
+
+    settings = get_effective_settings(session) if run_llm else get_settings()
+    budget = get_budget(session) if run_llm else None
+    run_bus = build_run_bus(budget=budget, run_id=run.id) if run_llm else default_bus()
+    active_llm = (llm_client or RealDesignLlm(settings)) if run_llm else None
+    ctx = build_change_review_context(
         session,
         run,
-        "AST_DIFF_COMPUTED",
-        "ast_diff_and_blast",
-        {
+        settings=settings,
+        llm=active_llm,
+        budget=budget,
+        bus=run_bus,
+        operator=author or OPERATOR_PLACEHOLDER,
+    )
+
+    def _ast_diff_and_blast(_inp: Any, _ctx: Any) -> Outcome:
+        diff = compute_script_ast_diff(
+            old_sql,
+            new_content,
+            filename=filename,
+            dialect=dialect or "oracle",
+        )
+        new_parsed = diff["new_parsed_script"]
+        new_feats = diff["new_chunk_features"]
+        new_agg = aggregate_script_features(new_feats)
+
+        candidate_script_id = target_script.id if target_script is not None else f"candidate:{review_id}"
+        candidate_script_dict = {
+            "id": candidate_script_id,
+            "filename": filename,
+            "relative_path": relative_path,
+            "file_kind": new_parsed.file_kind,
+            "target_tables": new_agg["target_tables"],
+            "source_tables": new_agg["source_tables"],
+            "commit_count": new_parsed.commit_count,
+            "has_exception_handler": new_parsed.has_exception_handler,
+        }
+        candidate_chunks_dicts = [
+            {
+                "id": f"cand_chunk_{idx}",
+                "script_id": candidate_script_id,
+                "chunk_index": ch.chunk_index,
+                "start_line": ch.start_line,
+                "end_line": ch.end_line,
+                "statement_kind": ch.statement_kind,
+                "is_dynamic_sql": ch.is_dynamic_sql,
+                "control_context": ch.control_context,
+                "target_tables": feat.target_tables,
+                "source_tables": feat.source_tables,
+                "ast_features": feat.to_dict(),
+                "ast_fingerprint": feat.ast_fingerprint,
+                "raw_sql": ch.raw_sql,
+            }
+            for idx, (ch, feat) in enumerate(zip(new_parsed.chunks, new_feats))
+        ]
+
+        candidate_findings = evaluate_script_rules(candidate_script_dict, candidate_chunks_dicts)
+
+        baseline_finding_sigs = set()
+        if target_script is not None:
+            base_chunks = (
+                session.query(ScriptChunkModel)
+                .filter(ScriptChunkModel.script_id == target_script.id)
+                .all()
+            )
+            base_findings = evaluate_script_rules(
+                {
+                    "id": target_script.id,
+                    "filename": target_script.filename,
+                    "file_kind": target_script.file_kind,
+                    "target_tables": target_script.target_tables_json or [],
+                    "source_tables": target_script.source_tables_json or [],
+                    "commit_count": target_script.commit_count,
+                    "has_exception_handler": target_script.has_exception_handler,
+                },
+                [
+                    {
+                        "id": c.id,
+                        "chunk_index": c.chunk_index,
+                        "start_line": c.start_line,
+                        "end_line": c.end_line,
+                        "statement_kind": c.statement_kind,
+                        "is_dynamic_sql": c.is_dynamic_sql,
+                        "control_context": c.control_context,
+                        "target_tables": c.target_tables_json or [],
+                        "source_tables": c.source_tables_json or [],
+                        "ast_features": c.ast_features_json or {},
+                        "ast_fingerprint": c.ast_fingerprint,
+                        "raw_sql": c.raw_sql,
+                    }
+                    for c in base_chunks
+                ],
+            )
+            baseline_finding_sigs = {(bf["rule_code"], bf["evidence_snippet"][:120]) for bf in base_findings}
+
+        new_findings: List[Dict[str, Any]] = []
+        for cf in candidate_findings:
+            sig = (cf["rule_code"], cf["evidence_snippet"][:120])
+            is_new = sig not in baseline_finding_sigs
+            item = dict(cf)
+            item["is_incremental"] = is_new
+            if ctype == "ADD" or is_new or cf["severity"] == "P0":
+                new_findings.append(item)
+
+        existing_scripts = session.query(ScriptFileModel).filter(ScriptFileModel.project_id == project_id).all()
+        existing_chunks = session.query(ScriptChunkModel).filter(ScriptChunkModel.project_id == project_id).all()
+        existing_schemas = session.query(TableSchemaModel).filter(TableSchemaModel.project_id == project_id).all()
+
+        base_script_dicts = [
+            {
+                "id": s.id,
+                "filename": s.filename,
+                "relative_path": s.relative_path,
+                "file_kind": s.file_kind,
+                "target_tables": s.target_tables_json or [],
+                "source_tables": s.source_tables_json or [],
+            }
+            for s in existing_scripts
+        ]
+        base_chunk_dicts = [
+            {
+                "id": c.id,
+                "script_id": c.script_id,
+                "start_line": c.start_line,
+                "end_line": c.end_line,
+                "statement_kind": c.statement_kind,
+                "target_tables": c.target_tables_json or [],
+                "source_tables": c.source_tables_json or [],
+                "ast_features": c.ast_features_json or {},
+                "ast_fingerprint": c.ast_fingerprint,
+                "raw_sql": c.raw_sql,
+            }
+            for c in existing_chunks
+        ]
+        schema_dicts = [{"table_name": sc.table_name} for sc in existing_schemas]
+
+        base_topology = build_lineage_topology(base_script_dicts, base_chunk_dicts, schema_dicts)
+        sim_scripts = [s for s in base_script_dicts if s["id"] != candidate_script_id] + [candidate_script_dict]
+        sim_chunks = [c for c in base_chunk_dicts if c["script_id"] != candidate_script_id] + candidate_chunks_dicts
+        sim_topology = build_lineage_topology(sim_scripts, sim_chunks, schema_dicts)
+
+        blast_radius = compute_blast_radius(candidate_script_id, sim_topology)
+
+        base_wc_tables = {wc["table"] for wc in base_topology.get("write_conflict_tables", [])}
+        sim_wc_tables = {wc["table"] for wc in sim_topology.get("write_conflict_tables", [])}
+        new_write_conflicts = sorted(sim_wc_tables - base_wc_tables)
+
+        base_tc_tables = {tc["table"] for tc in base_topology.get("truncate_conflicts", [])}
+        sim_tc_tables = {tc["table"] for tc in sim_topology.get("truncate_conflicts", [])}
+        new_truncate_conflicts = sorted(sim_tc_tables - base_tc_tables)
+
+        base_cycles = {tuple(c) for c in base_topology.get("cycles", [])}
+        sim_cycles = [c for c in sim_topology.get("cycles", []) if tuple(c) not in base_cycles]
+
+        blast_radius["new_write_conflict_tables"] = new_write_conflicts
+        blast_radius["new_truncate_conflict_tables"] = new_truncate_conflicts
+        blast_radius["new_cycles"] = sim_cycles
+
+        diff_summary_base = {
+            "unified_diff": diff["unified_diff"],
             "added_lines": diff["added_lines"],
             "removed_lines": diff["removed_lines"],
-            "total_impacted_scripts": blast_radius["total_impacted_scripts"],
-            "incremental_findings_count": len(new_findings),
-        },
-    )
-    append_event(
-        session,
-        run,
-        "GATE_EVALUATED",
-        "deterministic_gate",
-        {
-            "deterministic_verdict": det_verdict,
-            "block_reasons": block_reasons,
-            "warn_reasons": warn_reasons,
-        },
-    )
+            "old_line_count": diff["old_line_count"],
+            "new_line_count": diff["new_line_count"],
+            "old_chunk_count": diff["old_chunk_count"],
+            "new_chunk_count": diff["new_chunk_count"],
+            "added_target_tables": diff["added_target_tables"],
+            "removed_target_tables": diff["removed_target_tables"],
+            "added_source_tables": diff["added_source_tables"],
+            "removed_source_tables": diff["removed_source_tables"],
+            "added_chunks": diff["added_chunks"],
+            "removed_chunks": diff["removed_chunks"],
+            "exception_handler_removed": diff["exception_handler_removed"],
+        }
+        return Outcome(
+            output={"diff": diff},
+            shared={
+                "diff_summary": diff_summary_base,
+                "blast_radius": blast_radius,
+                "new_findings": new_findings,
+            },
+            events=[
+                (
+                    "AST_DIFF_COMPUTED",
+                    "ast_diff_and_blast",
+                    {
+                        "added_lines": diff["added_lines"],
+                        "removed_lines": diff["removed_lines"],
+                        "total_impacted_scripts": blast_radius["total_impacted_scripts"],
+                        "incremental_findings_count": len(new_findings),
+                    },
+                )
+            ],
+            when="always",
+        )
 
-    ai_review_json: Dict[str, Any] = {"ai_status": "SKIPPED"}
-    final_verdict = det_verdict
+    def _deterministic_gate(inp: Any, node_ctx: Any) -> Outcome:
+        diff = (inp or {}).get("diff") or {}
+        blast_radius = node_ctx.get("blast_radius") or {}
+        new_findings = node_ctx.get("new_findings") or []
 
-    if run_llm:
-        budget = get_budget(session)
-        llm = llm_client or RealDesignLlm(get_effective_settings(session))
-        run_bus = build_run_bus(budget=budget, run_id=run.id)
+        block_reasons: List[str] = []
+        warn_reasons: List[str] = []
+
+        p0_findings = [f for f in new_findings if f["severity"] == "P0" and (ctype == "ADD" or f["is_incremental"])]
+        p1_findings = [f for f in new_findings if f["severity"] == "P1" and (ctype == "ADD" or f["is_incremental"])]
+
+        if p0_findings:
+            block_reasons.append(f"新增或命中 P0 阻断级缺陷 ({', '.join(sorted({f['rule_code'] for f in p0_findings}))})")
+        if diff.get("exception_handler_removed"):
+            block_reasons.append("修改后移除了原有 EXCEPTION 异常处理保护块")
+        if blast_radius.get("new_truncate_conflict_tables"):
+            block_reasons.append(
+                f"触发新的跨脚本 TRUNCATE 并发读取冲突 ({', '.join(blast_radius['new_truncate_conflict_tables'])})"
+            )
+        if blast_radius.get("new_write_conflict_tables"):
+            block_reasons.append(
+                f"新增主表多脚本并发写冲突 ({', '.join(blast_radius['new_write_conflict_tables'])})"
+            )
+        if blast_radius.get("new_cycles"):
+            block_reasons.append("引入新的全项目血缘环形依赖 (DAG Cycle)")
+
+        if p1_findings:
+            warn_reasons.append(f"新增 P1 性能/规范隐患 ({', '.join(sorted({f['rule_code'] for f in p1_findings}))})")
+        if (blast_radius.get("total_impacted_scripts") or 0) >= 1:
+            warn_reasons.append(
+                f"下游影响波及 {blast_radius['total_impacted_scripts']} 个脚本（最深 {blast_radius['max_hop']} 跳）"
+            )
+        if diff.get("removed_target_tables"):
+            warn_reasons.append(f"修改移除了原有目标表写入：{', '.join(diff['removed_target_tables'])}")
+
+        if block_reasons:
+            det_verdict = "BLOCK"
+        elif warn_reasons:
+            det_verdict = "WARN"
+        else:
+            det_verdict = "PASS"
+
+        return Outcome(
+            output=inp,
+            shared={
+                "diff_summary": {
+                    "block_reasons": block_reasons,
+                    "warn_reasons": warn_reasons,
+                },
+                "gate_result": {
+                    "deterministic_verdict": det_verdict,
+                    "final_verdict": det_verdict,
+                    "block_reasons": block_reasons,
+                    "warn_reasons": warn_reasons,
+                },
+            },
+            events=[
+                (
+                    "GATE_EVALUATED",
+                    "deterministic_gate",
+                    {
+                        "deterministic_verdict": det_verdict,
+                        "block_reasons": block_reasons,
+                        "warn_reasons": warn_reasons,
+                    },
+                )
+            ],
+            when="always",
+        )
+
+    def _ai_risk_review(inp: Any, node_ctx: Any) -> Outcome:
+        if not run_llm or node_ctx.llm is None:
+            return Outcome(
+                shared={"ai_review": {"ai_status": "SKIPPED"}},
+                when="needs_approval",
+            )
+
+        diff = (inp or {}).get("diff") or {}
+        blast_radius = node_ctx.get("blast_radius") or {}
+        new_findings = node_ctx.get("new_findings") or []
+        gate_res = node_ctx.get("gate_result") or {}
+        det_verdict = str(gate_res.get("deterministic_verdict") or "PASS")
+        block_reasons = gate_res.get("block_reasons") or []
+        warn_reasons = gate_res.get("warn_reasons") or []
+
         try:
-            with llm_execution_scope(bus=run_bus):
+            with llm_execution_scope(bus=node_ctx.bus):
                 risk_review, _ = call_llm_validated(
-                    llm,
+                    node_ctx.llm,
                     "assess_change_risk",
                     instruction=(
                         f"请针对本次 `{ctype}` 变更 (`{filename}`)，结合 Unified Diff、确定性门禁原因及下游爆破半径，"
@@ -362,7 +418,7 @@ def evaluate_script_change(
                         "deterministic_verdict": det_verdict,
                         "block_reasons": block_reasons,
                         "warn_reasons": warn_reasons,
-                        "unified_diff": diff["unified_diff"][:5000],
+                        "unified_diff": str(diff.get("unified_diff") or "")[:5000],
                         "blast_radius": blast_radius,
                         "incremental_findings": [
                             {
@@ -374,10 +430,10 @@ def evaluate_script_change(
                             for f in new_findings[:10]
                         ],
                     },
-                    bus=run_bus,
+                    bus=node_ctx.bus,
                 )
                 gate_summary, _ = call_llm_validated(
-                    llm,
+                    node_ctx.llm,
                     "summarize_release_gate",
                     instruction=(
                         f"基于研发、DBA、测试三视角给出上线门禁总结推荐。注意：确定性门禁为 `{det_verdict}`，"
@@ -389,57 +445,92 @@ def evaluate_script_change(
                         "risk_summary": risk_review.get("risk_summary", ""),
                         "blast_radius": blast_radius,
                     },
-                    bus=run_bus,
+                    bus=node_ctx.bus,
                 )
             ai_verdict = str(gate_summary.get("recommended_verdict") or det_verdict).upper()
             final_verdict = _higher_verdict(det_verdict, ai_verdict)
-            guard_snap = run_bus.budget_guard.snapshot() if run_bus.budget_guard else {}
+            guard_snap = node_ctx.bus.budget_guard.snapshot() if node_ctx.bus.budget_guard else {}
             ai_review_json = {
                 "ai_status": "COMPLETED",
                 **risk_review,
                 **gate_summary,
                 "llm_calls": guard_snap.get("llm_calls", 0),
             }
-            append_event(
-                session,
-                run,
-                "AI_REVIEW_COMPLETED",
-                "ai_risk_review",
-                {
-                    "deterministic_verdict": det_verdict,
-                    "ai_verdict": ai_verdict,
-                    "final_verdict": final_verdict,
+            return Outcome(
+                shared={
+                    "ai_review": ai_review_json,
+                    "gate_result": {
+                        "ai_verdict": ai_verdict,
+                        "final_verdict": final_verdict,
+                    },
                 },
-                bus=run_bus,
+                events=[
+                    (
+                        "AI_REVIEW_COMPLETED",
+                        "ai_risk_review",
+                        {
+                            "deterministic_verdict": det_verdict,
+                            "ai_verdict": ai_verdict,
+                            "final_verdict": final_verdict,
+                        },
+                    )
+                ],
+                when="needs_approval",
             )
         except ProviderAuthOrBillingError as exc:
-            ai_review_json = {"ai_status": "BILLING_OR_AUTH_ERROR", "error": str(exc)}
             logger.warning("Change review AI aborted on billing/auth: %s", exc)
-        except Exception as exc:
-            ai_review_json = {"ai_status": "FAILED_FALLBACK_OFFLINE", "error": str(exc)}
+            return Outcome(
+                shared={"ai_review": {"ai_status": "BILLING_OR_AUTH_ERROR", "error": str(exc)}},
+                when="needs_approval",
+            )
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Change review AI failed cleanly: %s", exc)
+            return Outcome(
+                shared={"ai_review": {"ai_status": "FAILED_FALLBACK_OFFLINE", "error": str(exc)}},
+                when="needs_approval",
+            )
 
-    interrupt_payload = make_interrupt_payload(
-        "RELEASE_APPROVAL_REQUIRED",
-        question=f"请确认是否批准 `{filename}`（{ctype}）变更上线？当前门禁结论：{final_verdict}",
-        pending_input={
-            "review_id": review_id,
-            "filename": filename,
-            "change_type": ctype,
-            "deterministic_verdict": det_verdict,
-            "final_verdict": final_verdict,
-            "block_reasons": block_reasons,
-            "warn_reasons": warn_reasons,
+    def _release_approval_gate(_inp: Any, node_ctx: Any) -> Outcome:
+        gate_res = node_ctx.get("gate_result") or {}
+        det_verdict = gate_res.get("deterministic_verdict", "PASS")
+        final_verdict = gate_res.get("final_verdict", det_verdict)
+        block_reasons = gate_res.get("block_reasons") or []
+        warn_reasons = gate_res.get("warn_reasons") or []
+        return Outcome.park(
+            "RELEASE_APPROVAL_REQUIRED",
+            question=f"请确认是否批准 `{filename}`（{ctype}）变更上线？当前门禁结论：{final_verdict}",
+            payload={
+                "review_id": review_id,
+                "filename": filename,
+                "change_type": ctype,
+                "deterministic_verdict": det_verdict,
+                "final_verdict": final_verdict,
+                "block_reasons": block_reasons,
+                "warn_reasons": warn_reasons,
+            },
+            node="release_approval_gate",
+            resume_node="release_approval_gate",
+            when="approve",
+        )
+
+    scheduler = Scheduler(
+        CHANGE_REVIEW_PLAN,
+        {
+            "ast_diff_and_blast": _ast_diff_and_blast,
+            "deterministic_gate": _deterministic_gate,
+            "ai_risk_review": _ai_risk_review,
+            "release_approval_gate": _release_approval_gate,
         },
-        resume_nodes={"RELEASE_APPROVAL_REQUIRED": "release_approval_gate"},
     )
-    append_event(
-        session,
-        run,
-        "RELEASE_APPROVAL_REQUIRED",
-        "release_approval_gate",
-        interrupt_payload,
-    )
+    scheduler.drive(ctx)
+
+    diff_summary_json = dict(ctx.get("diff_summary") or {})
+    blast_radius = dict(ctx.get("blast_radius") or {})
+    new_findings = list(ctx.get("new_findings") or [])
+    gate_res = dict(ctx.get("gate_result") or {})
+    ai_review_json = dict(ctx.get("ai_review") or {"ai_status": "SKIPPED"})
+    det_verdict = str(gate_res.get("deterministic_verdict") or "PASS")
+    final_verdict = str(gate_res.get("final_verdict") or det_verdict)
 
     review = ChangeReviewModel(
         id=review_id,

@@ -111,6 +111,9 @@ END;"""
         assert trace["chain_verified"] is True
         kinds = [e["kind"] for e in trace["events"]]
         assert kinds == ["RUN_CREATED", "AST_DIFF_COMPUTED", "GATE_EVALUATED", "RELEASE_APPROVAL_REQUIRED"]
+        span_labels = [sp["label"] for sp in trace["spans"]]
+        assert "AST 差异比对与爆破半径计算" in span_labels
+        assert "上线前人工审批门禁" in span_labels
 
 
 def test_approve_merge_baseline_and_interrupt_idempotency(tmp_path: Path):
@@ -157,3 +160,52 @@ END;"""
         trace = get_review_run_trace(db, rev["run_id"])
         assert trace["chain_verified"] is True
         assert trace["events"][-1]["kind"] == "RELEASE_APPROVED"
+
+
+def test_reject_change_review_idempotent_and_recover_channels(tmp_path: Path):
+    from app.infra.db_tables import RunModel
+    from app.policy import project, recover_change_review_channels
+
+    Session = _new_test_session(tmp_path)
+    with Session() as db:
+        proj = _seed_three_hop_project(db)
+        s1 = db.query(ScriptFileModel).filter(ScriptFileModel.project_id == proj.id, ScriptFileModel.filename == "SP_STAGE_1.sql").first()
+
+        risky_v2 = """CREATE OR REPLACE PROCEDURE SP_STAGE_1 IS
+BEGIN
+  UPDATE MID_A SET AMT = 0;
+  COMMIT;
+END;"""
+        rev = evaluate_script_change(
+            db,
+            proj.id,
+            change_type="MODIFY",
+            filename="SP_STAGE_1.sql",
+            target_script_id=s1.id,
+            new_content=risky_v2,
+            author="dev_user",
+            change_summary="有风险变更",
+        )
+        run = db.get(RunModel, rev["run_id"])
+        assert project(db, run).status == "WAITING_HUMAN"
+
+        recovered = recover_change_review_channels(db, run)
+        assert recovered["gate_result"]["deterministic_verdict"] == "BLOCK"
+        assert recovered["gate_result"]["final_verdict"] == "BLOCK"
+        assert recovered["diff_summary"]["block_reasons"]
+
+        rej = reject_change_review(db, rev["id"], reviewer="qa_lead", comment="存在阻塞缺陷")
+        assert rej["status"] == "REJECTED"
+        assert rej["merged_to_baseline"] is False
+        assert rej["idempotent_replay"] is False
+        assert project(db, run).status == "REJECTED"
+
+        replay = reject_change_review(db, rev["id"], reviewer="qa_lead", comment="存在阻塞缺陷")
+        assert replay["idempotent_replay"] is True
+
+        with pytest.raises(ValueError, match="已被驳回"):
+            approve_change_review(db, rev["id"], reviewer="qa_lead", comment="强行放行")
+
+        trace = get_review_run_trace(db, rev["run_id"])
+        assert trace is not None and trace["chain_verified"] is True
+        assert trace["events"][-1]["kind"] == "RELEASE_REJECTED"

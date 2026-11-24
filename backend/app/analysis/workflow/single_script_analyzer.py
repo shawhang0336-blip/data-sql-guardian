@@ -1,10 +1,9 @@
-"""Single-script optimization orchestrator: deterministic 16 rules + guarded BSP AI diagnosis & sqlglot-verified rewrite."""
+"""Single-script optimization orchestrator: deterministic 16 rules + Scheduler BSP AI diagnosis & sqlglot-verified rewrite."""
 
 from __future__ import annotations
 
 import logging
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import delete
@@ -13,7 +12,6 @@ from sqlalchemy.orm import Session
 from app.analysis.core import evaluate_script_rules
 from app.catalog import serialize_script
 from app.infra.config import get_budget, get_effective_settings
-from app.infra.db import SessionLocal
 from app.infra.db_tables import (
     OptimizationFindingModel,
     ScriptChunkModel,
@@ -21,14 +19,13 @@ from app.infra.db_tables import (
     ScriptProjectModel,
 )
 from app.infra.errors import ProviderAuthOrBillingError
-from app.infra.llm import (
-    RealDesignLlm,
-    call_llm_validated,
-    llm_execution_scope,
-    submit_with_context,
+from app.infra.llm import RealDesignLlm, call_llm_validated, llm_execution_scope
+from app.kernel import Outcome, Scheduler, Send, WaveExecutionError, append_event, create_run
+from app.policy import (
+    PROJECT_ANALYSIS_PLAN,
+    build_analysis_context,
+    build_script_child_bus,
 )
-from app.kernel import append_event, create_run
-from app.policy import build_script_child_bus
 
 try:
     import sqlglot
@@ -52,7 +49,6 @@ def _verify_sql_syntax(sql_text: str, dialect: str) -> bool:
         sqlglot.parse_one(text, read=sg_dialect)
         return True
     except Exception:
-        # Allow PL/SQL procedural snippets if simple statement keyword present
         upper = text.upper()
         return any(upper.startswith(k) for k in ("SELECT", "WITH", "INSERT", "MERGE", "UPDATE", "DELETE"))
 
@@ -88,10 +84,7 @@ def replace_script_findings(
         )
         .all()
     )
-    preserved_keys = {
-        (f.rule_code, f.start_line): f
-        for f in preserved
-    }
+    preserved_keys = {(f.rule_code, f.start_line): f for f in preserved}
     session.execute(
         delete(OptimizationFindingModel).where(
             OptimizationFindingModel.project_id == project_id,
@@ -150,7 +143,7 @@ def analyze_single_script(
     max_chunks_to_refine: int = 3,
     max_llm_calls: int = 8,
 ) -> Dict[str, Any]:
-    """Run deterministic single-script audit and optional BSP guarded AI root-cause diagnosis & SQL rewrite."""
+    """Run deterministic single-script audit and optional BSP `Scheduler` AI root-cause diagnosis & SQL rewrite."""
     script = (
         session.query(ScriptFileModel)
         .filter(ScriptFileModel.project_id == project_id, ScriptFileModel.id == script_id)
@@ -193,33 +186,34 @@ def analyze_single_script(
 
     if run_llm and chunk_dicts:
         budget = get_budget(session)
-        llm = llm_client or RealDesignLlm(get_effective_settings(session))
+        settings = get_effective_settings(session)
+        llm = llm_client or RealDesignLlm(settings)
         rm_run = create_run(
             session,
             spec_id=f"script:{script.filename}",
-            initial_node="static_scanner",
+            initial_node="created",
             initial_payload={"project_id": project_id, "script_id": script_id},
         )
         run_id = rm_run.id
-        append_event(
-            session,
-            rm_run,
-            "STATIC_SCANNED",
-            "static_scanner",
-            {"script_finding_count": len(rows)},
-        )
-        session.commit()
 
         child_bus = build_script_child_bus(
             max_calls=min(max_llm_calls, int(budget.get("max_calls_per_script", 8))),
             max_elapsed_seconds=int(budget.get("max_elapsed_seconds", 600)),
             script_tag=script.filename,
         )
+        ctx = build_analysis_context(
+            session,
+            rm_run,
+            settings=settings,
+            llm=llm,
+            bus=child_bus,
+            concurrency=max(1, min(max_chunks_to_refine, 3)),
+        )
 
-        # Pick chunks with high-priority findings or complex DML for LLM review
         finding_chunk_ids = list(
             dict.fromkeys(
-                r.chunk_id for r in sorted(rows, key=lambda x: {"P0": 0, "P1": 1, "P2": 2}.get(x.severity, 9))
+                r.chunk_id
+                for r in sorted(rows, key=lambda x: {"P0": 0, "P1": 1, "P2": 2}.get(x.severity, 9))
                 if r.chunk_id
             )
         )
@@ -229,11 +223,12 @@ def analyze_single_script(
         candidate_chunks = candidate_chunks[:max_chunks_to_refine]
         allowed_chunk_ids = [c["id"] for c in chunk_dicts]
         chunk_by_id = {c["id"]: c for c in chunk_dicts}
+        plan_state: Dict[str, Any] = {"review_focus": "", "script_purpose": ""}
 
-        try:
-            with llm_execution_scope(bus=child_bus):
+        def _static_scan(_inp: Any, node_ctx: Any) -> Outcome:
+            with llm_execution_scope(bus=node_ctx.bus):
                 plan_resp, _ = call_llm_validated(
-                    llm,
+                    node_ctx.llm,
                     "plan_script_review",
                     instruction=(
                         f"请针对脚本 `{script.filename}` ({script.dialect}) 的切块结构与离线静态扫描发现，"
@@ -260,140 +255,215 @@ def analyze_single_script(
                             for r in rows[:15]
                         ],
                     },
-                    bus=child_bus,
+                    bus=node_ctx.bus,
                 )
-                chosen_ids = [
-                    cid for cid in (plan_resp.get("priority_chunk_ids") or [])
-                    if cid in chunk_by_id
-                ][:max_chunks_to_refine]
-                if not chosen_ids:
-                    chosen_ids = [c["id"] for c in candidate_chunks]
+            chosen_ids = [
+                cid for cid in (plan_resp.get("priority_chunk_ids") or [])
+                if cid in chunk_by_id
+            ][:max_chunks_to_refine]
+            if not chosen_ids:
+                chosen_ids = [c["id"] for c in candidate_chunks]
 
-                append_event(
-                    session,
-                    rm_run,
-                    "CHUNK_ANALYZED",
-                    "chunk_analyzer",
-                    {
-                        "planned_chunks": chosen_ids,
-                        "script_purpose": plan_resp.get("script_purpose", ""),
-                        "review_focus": plan_resp.get("review_focus", ""),
+            plan_state["review_focus"] = plan_resp.get("review_focus", "")
+            plan_state["script_purpose"] = plan_resp.get("script_purpose", "")
+
+            findings_summary = [
+                {"rule": r.rule_code, "severity": r.severity, "chunk_id": r.chunk_id, "title": r.title}
+                for r in rows
+            ]
+            sends: List[Send] = []
+            for cid in chosen_ids:
+                task_payload = {
+                    "chunk_id": cid,
+                    "filename": script.filename,
+                    "dialect": script.dialect,
+                    "chunk": dict(chunk_by_id[cid]),
+                    "local_findings": [
+                        {
+                            "rule_code": r.rule_code,
+                            "severity": r.severity,
+                            "title": r.title,
+                            "description": r.description,
+                        }
+                        for r in rows
+                        if r.chunk_id == cid
+                    ],
+                }
+                sends.append(Send("chunk_worker", task_payload, label=cid))
+
+            scan_evt = (
+                "STATIC_SCANNED",
+                "static_scan",
+                {
+                    "script_finding_count": len(rows),
+                    "planned_chunks": chosen_ids,
+                    "script_purpose": plan_state["script_purpose"],
+                    "review_focus": plan_state["review_focus"],
+                },
+            )
+            return Outcome(
+                shared={"script_findings": findings_summary},
+                sends=sends,
+                events=[scan_evt],
+                when="fanout" if sends else "skip_ai",
+            )
+
+        def _chunk_worker(task_input: Any, node_ctx: Any) -> Outcome:
+            cid = task_input["chunk_id"]
+            ch = task_input["chunk"]
+            fname = task_input["filename"]
+            dialect = task_input["dialect"]
+            local_findings = task_input["local_findings"]
+
+            with llm_execution_scope(bus=node_ctx.bus):
+                diag, _ = call_llm_validated(
+                    node_ctx.llm,
+                    "diagnose_chunk_issues",
+                    instruction=(
+                        f"深入分析脚本 `{fname}` 第 {ch['start_line']}-{ch['end_line']} 行 SQL 切块，"
+                        "指出每条问题的 root_cause、actionable_fix、expected_benefit，或澄清误报。"
+                    ),
+                    payload={
+                        "chunk_id": cid,
+                        "allowed_chunk_ids": [cid],
+                        "start_line": ch["start_line"],
+                        "end_line": ch["end_line"],
+                        "statement_kind": ch["statement_kind"],
+                        "control_context": ch["control_context"],
+                        "raw_sql": ch["raw_sql"][:3500],
+                        "static_findings": [
+                            {"rule": f["rule_code"], "title": f["title"], "desc": f["description"]}
+                            for f in local_findings
+                        ],
                     },
-                    bus=child_bus,
+                    bus=node_ctx.bus,
                 )
-
-                def _diagnose_and_rewrite(cid: str) -> Dict[str, Any]:
-                    ch = chunk_by_id[cid]
-                    local_findings = [r for r in rows if r.chunk_id == cid]
-                    diag, _ = call_llm_validated(
-                        llm,
-                        "diagnose_chunk_issues",
+                diag_items = diag.get("findings") or []
+                first_diag = diag_items[0] if diag_items and isinstance(diag_items[0], dict) else {}
+                rewrite_out: Dict[str, Any] = {}
+                if (
+                    local_findings
+                    and local_findings[0]["severity"] in ("P0", "P1")
+                    and ch["statement_kind"] in ("SELECT", "INSERT", "MERGE", "UPDATE", "DELETE")
+                ):
+                    rw, _ = call_llm_validated(
+                        node_ctx.llm,
+                        "propose_sql_rewrite",
                         instruction=(
-                            f"深入分析脚本 `{script.filename}` 第 {ch['start_line']}-{ch['end_line']} 行 SQL 切块，"
-                            "指出每条问题的 root_cause、actionable_fix、expected_benefit，或澄清误报。"
+                            f"在严格保持业务语义与目标写入表不变的前提下，为第 {ch['start_line']}-{ch['end_line']} 行提供等价优化后的完整 SQL。"
                         ),
                         payload={
                             "chunk_id": cid,
                             "allowed_chunk_ids": [cid],
-                            "start_line": ch["start_line"],
-                            "end_line": ch["end_line"],
-                            "statement_kind": ch["statement_kind"],
-                            "control_context": ch["control_context"],
-                            "raw_sql": ch["raw_sql"][:3500],
-                            "static_findings": [
-                                {"rule": r.rule_code, "title": r.title, "desc": r.description}
-                                for r in local_findings
-                            ],
+                            "required_target_tables": ch["target_tables"],
+                            "dialect": dialect,
+                            "original_sql": ch["raw_sql"][:3500],
+                            "rule_code": local_findings[0]["rule_code"],
+                            "issue_summary": first_diag.get("root_cause", local_findings[0]["description"]),
                         },
-                        bus=child_bus,
+                        bus=node_ctx.bus,
                     )
-                    diag_items = diag.get("findings") or []
-                    first_diag = diag_items[0] if diag_items and isinstance(diag_items[0], dict) else {}
-                    rewrite_out: Dict[str, Any] = {}
-                    # Trigger SQL rewrite for P0/P1 or non-false-positive findings on query/DML chunks
-                    if local_findings and local_findings[0].severity in ("P0", "P1") and ch["statement_kind"] in ("SELECT", "INSERT", "MERGE", "UPDATE", "DELETE"):
-                        rw, _ = call_llm_validated(
-                            llm,
-                            "propose_sql_rewrite",
-                            instruction=(
-                                f"在严格保持业务语义与目标写入表不变的前提下，为第 {ch['start_line']}-{ch['end_line']} 行提供等价优化后的完整 SQL。"
-                            ),
-                            payload={
-                                "chunk_id": cid,
-                                "allowed_chunk_ids": [cid],
-                                "required_target_tables": ch["target_tables"],
-                                "dialect": script.dialect,
-                                "original_sql": ch["raw_sql"][:3500],
-                                "rule_code": local_findings[0].rule_code,
-                                "issue_summary": first_diag.get("root_cause", local_findings[0].description),
-                            },
-                            bus=child_bus,
-                        )
-                        rewritten = (rw.get("rewritten_sql") or "").strip()
-                        if rewritten and _verify_sql_syntax(rewritten, script.dialect):
-                            rewrite_out = rw
-                    return {"chunk_id": cid, "diagnosis": diag, "rewrite": rewrite_out}
+                    rewritten = (rw.get("rewritten_sql") or "").strip()
+                    if rewritten and _verify_sql_syntax(rewritten, dialect):
+                        rewrite_out = rw
 
-                results: List[Dict[str, Any]] = []
-                workers = max(1, min(len(chosen_ids), 3))
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [submit_with_context(pool, _diagnose_and_rewrite, cid) for cid in chosen_ids]
-                    for fut in futures:
-                        results.append(fut.result())
-
-                for res in results:
-                    cid = res["chunk_id"]
-                    diag = res["diagnosis"]
-                    rw = res["rewrite"]
-                    diag_by_rule = {
-                        str(d.get("rule_code", "")): d
-                        for d in (diag.get("findings") or [])
-                        if isinstance(d, dict)
-                    }
-                    first_diag = (diag.get("findings") or [{}])[0] if diag.get("findings") else {}
-                    matching = [r for r in rows if r.chunk_id == cid]
-                    for r in matching:
-                        item = diag_by_rule.get(r.rule_code) or (first_diag if isinstance(first_diag, dict) else {})
-                        if item.get("root_cause"):
-                            r.description = f"{r.description}\n\n[AI 根因诊断] {item['root_cause']}"
-                        if item.get("actionable_fix"):
-                            r.suggestion = f"{r.suggestion}\n\n[AI 修复方案] {item['actionable_fix']}"
-                        if rw.get("rewritten_sql"):
-                            r.rewritten_sql = rw["rewritten_sql"]
-                        if rw.get("expected_benefit"):
-                            r.expected_benefit = rw["expected_benefit"]
-                        elif item.get("expected_benefit"):
-                            r.expected_benefit = item["expected_benefit"]
-                        r.ai_refined = True
-                    append_event(
-                        session,
-                        rm_run,
+            return Outcome(
+                output={"chunk_id": cid},
+                shared={"chunk_diagnostics": {cid: {"diagnosis": diag, "rewrite": rewrite_out}}},
+                events=[
+                    (
                         "CHUNK_ANALYZED",
-                        "chunk_analyzer",
+                        "chunk_worker",
                         {
+                            "label": cid,
                             "chunk_id": cid,
                             "findings_count": len(diag.get("findings") or []),
-                            "has_rewrite": bool(rw.get("rewritten_sql")),
+                            "has_rewrite": bool(rewrite_out.get("rewritten_sql")),
                         },
-                        bus=child_bus,
                     )
+                ],
+                when="always",
+            )
 
-                session.commit()
-                ai_status = "COMPLETED"
-                guard_snap = child_bus.budget_guard.snapshot() if child_bus.budget_guard else {}
-                ai_notes = {
-                    "analyzed_chunks": len(results),
-                    "llm_calls": guard_snap.get("llm_calls", 0),
-                    "review_focus": plan_resp.get("review_focus", ""),
-                    "script_purpose": plan_resp.get("script_purpose", ""),
+        def _chunk_join(_inp: Any, node_ctx: Any) -> Outcome:
+            nonlocal ai_status, ai_notes
+            diag_map: Dict[str, Dict[str, Any]] = node_ctx.get("chunk_diagnostics") or {}
+            for cid, res in diag_map.items():
+                diag = res["diagnosis"]
+                rw = res["rewrite"]
+                diag_by_rule = {
+                    str(d.get("rule_code", "")): d
+                    for d in (diag.get("findings") or [])
+                    if isinstance(d, dict)
                 }
+                first_diag = (diag.get("findings") or [{}])[0] if diag.get("findings") else {}
+                for r in rows:
+                    if r.chunk_id != cid:
+                        continue
+                    item = diag_by_rule.get(r.rule_code) or (first_diag if isinstance(first_diag, dict) else {})
+                    if item.get("root_cause"):
+                        r.description = f"{r.description}\n\n[AI 根因诊断] {item['root_cause']}"
+                    if item.get("actionable_fix"):
+                        r.suggestion = f"{r.suggestion}\n\n[AI 修复方案] {item['actionable_fix']}"
+                    if rw.get("rewritten_sql"):
+                        r.rewritten_sql = rw["rewritten_sql"]
+                    if rw.get("expected_benefit"):
+                        r.expected_benefit = rw["expected_benefit"]
+                    elif item.get("expected_benefit"):
+                        r.expected_benefit = item["expected_benefit"]
+                    r.ai_refined = True
+
+            guard_snap = node_ctx.bus.budget_guard.snapshot() if node_ctx.bus.budget_guard else {}
+            ai_status = "COMPLETED"
+            ai_notes = {
+                "analyzed_chunks": len(diag_map),
+                "llm_calls": guard_snap.get("llm_calls", 0),
+                "review_focus": plan_state["review_focus"],
+                "script_purpose": plan_state["script_purpose"],
+            }
+            return Outcome(
+                events=[("ANALYSIS_COMPLETED", "chunk_join", {"analyzed_chunks": len(diag_map)})],
+                when="always",
+            )
+
+        def _completed(_inp: Any, _node_ctx: Any) -> Outcome:
+            nonlocal ai_status, ai_notes
+            ai_status = "COMPLETED"
+            ai_notes = {
+                "analyzed_chunks": 0,
+                "llm_calls": 0,
+                "review_focus": plan_state["review_focus"],
+                "script_purpose": plan_state["script_purpose"],
+            }
+            return Outcome(
+                events=[("ANALYSIS_COMPLETED", "completed", {"analyzed_chunks": 0})],
+                when="always",
+            )
+
+        try:
+            Scheduler(
+                PROJECT_ANALYSIS_PLAN,
+                {
+                    "static_scan": _static_scan,
+                    "chunk_worker": _chunk_worker,
+                    "chunk_join": _chunk_join,
+                    "completed": _completed,
+                },
+            ).drive(ctx)
         except ProviderAuthOrBillingError as exc:
             ai_status = "BILLING_OR_AUTH_ERROR"
             ai_notes = {"error": str(exc)}
+            append_event(session, rm_run, "RUN_FAILED", "static_scan", {"error": str(exc)})
+            session.commit()
             logger.warning("Single-script LLM analysis aborted due to billing/auth: %s", exc)
-        except Exception as exc:
-            ai_status = "FAILED_FALLBACK_OFFLINE"
+        except Exception as exc:  # noqa: BLE001
+            is_billing = isinstance(exc, WaveExecutionError) and any(
+                isinstance(err, ProviderAuthOrBillingError) for _, err in exc.errors
+            )
+            ai_status = "BILLING_OR_AUTH_ERROR" if is_billing else "FAILED_FALLBACK_OFFLINE"
             ai_notes = {"error": str(exc)}
+            append_event(session, rm_run, "RUN_FAILED", "static_scan", {"error": str(exc)})
+            session.commit()
             logger.warning("Single-script LLM refinement failed cleanly, keeping offline findings: %s", exc)
 
     return {

@@ -9,12 +9,13 @@ from app.infra.db_tables import RunModel
 from app.kernel.event_log import RunState, fold_with, project_many_with, project_with
 from app.kernel.plan import PlanEdge, PlanNode, WorkflowPlan
 
-# ── 1. 全项目分析与脚本优化拓扑 ──────────────────────────────────────────────────
+# ── 1. 全项目分析与单脚本 BSP 优化拓扑 ────────────────────────────────────────────
 
 PROJECT_ANALYSIS_NODES: Tuple[PlanNode, ...] = (
     PlanNode("created", "已创建任务", "stage"),
     PlanNode("static_scan", "切块与静态规则体检", "stage"),
-    PlanNode("chunk_fanout", "切块级 AI 深度诊断与 SQL 改写", "stage"),
+    PlanNode("chunk_worker", "切块级 AI 深度诊断与 SQL 改写", "stage"),
+    PlanNode("chunk_join", "切块诊断结果持久化汇聚", "stage"),
     PlanNode("project_synthesis", "全项目架构重构建议合成", "stage"),
     PlanNode("completed", "优化报告已就绪", "terminal"),
     PlanNode("failed", "失败", "terminal"),
@@ -22,8 +23,12 @@ PROJECT_ANALYSIS_NODES: Tuple[PlanNode, ...] = (
 
 PROJECT_ANALYSIS_EDGES: Tuple[PlanEdge, ...] = (
     PlanEdge("created", "static_scan", "always"),
-    PlanEdge("static_scan", "chunk_fanout", "always"),
-    PlanEdge("chunk_fanout", "project_synthesis", "always"),
+    PlanEdge("static_scan", "chunk_worker", "fanout"),
+    PlanEdge("static_scan", "project_synthesis", "synthesize"),
+    PlanEdge("static_scan", "completed", "skip_ai"),
+    PlanEdge("chunk_worker", "chunk_join", "always"),
+    PlanEdge("chunk_join", "completed", "always"),
+    PlanEdge("chunk_join", "failed", "failed"),
     PlanEdge("project_synthesis", "completed", "always"),
     PlanEdge("project_synthesis", "failed", "failed"),
 )
@@ -74,8 +79,10 @@ def _apply(state: RunState, kind: str, payload: Dict[str, Any]) -> RunState:
     if kind == "STATIC_SCANNED":
         return replace(state, status="RUNNING", current_node="static_scan", result_json=payload)
     if kind == "CHUNK_ANALYZED":
-        return replace(state, status="RUNNING", current_node="chunk_fanout", result_json=payload)
+        return replace(state, status="RUNNING", current_node="chunk_worker", result_json=payload)
     if kind == "PROJECT_SYNTHESIZED":
+        return replace(state, status="COMPLETED", current_node="completed", result_json=payload)
+    if kind == "ANALYSIS_COMPLETED":
         return replace(state, status="COMPLETED", current_node="completed", result_json=payload)
     if kind == "AST_DIFF_COMPUTED":
         return replace(state, status="RUNNING", current_node="ast_diff_and_blast", result_json=payload)

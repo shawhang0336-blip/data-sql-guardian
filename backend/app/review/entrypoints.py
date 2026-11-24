@@ -25,11 +25,18 @@ from app.infra.db_tables import (
 )
 from app.ingestion import aggregate_script_features, analyze_chunk_ast, chunk_sql_script
 from app.kernel import (
+    Outcome,
+    Scheduler,
     answer_interrupt,
     build_trace,
     latest_interrupt,
-    record_interrupt_answer,
     verify_chain,
+)
+from app.policy import (
+    CHANGE_REVIEW_PLAN,
+    PROJECT_ANALYSIS_PLAN,
+    build_change_review_context,
+    default_bus,
 )
 from .change_evaluator import serialize_review
 
@@ -173,6 +180,114 @@ def _merge_review_to_baseline(session: Session, review: ChangeReviewModel, autho
     return script_row
 
 
+def _decide_change_review(
+    session: Session,
+    review_id: str,
+    *,
+    decision: str,
+    reviewer: str,
+    comment: str,
+    merge_baseline: bool,
+) -> Dict[str, Any]:
+    """Shared Scheduler Interrupt resume handler for releasing or rejecting a change review."""
+    review = session.get(ChangeReviewModel, review_id)
+    if review is None:
+        raise ValueError(f"未找到变更评估单: {review_id}")
+    if decision == "APPROVE" and review.status == "REJECTED":
+        raise ValueError("该变更单已被驳回，禁止重复批准")
+    if decision == "REJECT" and review.status == "APPROVED":
+        raise ValueError("该变更单已批准合并基线，不可驳回")
+
+    run = session.get(RunModel, review.run_id)
+    if run is None:
+        raise ValueError(f"未找到关联 Run: {review.run_id}")
+
+    answer_kind = "RELEASE_APPROVED" if decision == "APPROVE" else "RELEASE_REJECTED"
+    answer_kinds = _APPROVAL_ANSWER_KINDS if decision == "APPROVE" else _REJECT_ANSWER_KINDS
+    edge_when = "approve" if decision == "APPROVE" else "reject"
+    effective_merge = bool(merge_baseline) if decision == "APPROVE" else False
+
+    fp = _decision_fingerprint(decision, reviewer, comment, effective_merge)
+    mode, pending_evt = answer_interrupt(
+        session,
+        run,
+        "RELEASE_APPROVAL_REQUIRED",
+        answer_kind,
+        fp,
+        answer_kinds=answer_kinds,
+        reject_conflict=True,
+    )
+    if mode == "REPLAY":
+        out = serialize_review(review)
+        out["idempotent_replay"] = True
+        return out
+
+    interrupt_evt = pending_evt or latest_interrupt(session, run, "RELEASE_APPROVAL_REQUIRED")
+    ctx = build_change_review_context(session, run, bus=default_bus(), approver=reviewer)
+
+    def _gate_resume_body(_inp: Any, node_ctx: Any) -> Outcome:
+        rv = node_ctx.resume_value or {}
+        if decision == "APPROVE" and rv.get("merge_baseline") and not review.merged_to_baseline:
+            _merge_review_to_baseline(session, review, author=rv["reviewer"])
+            review.merged_to_baseline = True
+
+        answer_payload: Dict[str, Any] = {
+            "decision": decision,
+            "reviewer": rv["reviewer"],
+            "comment": rv["comment"],
+            "merge_baseline": rv["merge_baseline"],
+        }
+        intr = rv.get("interrupt_evt")
+        if intr is not None:
+            interrupt_id = (intr.payload_json or {}).get("interrupt_id")
+            if interrupt_id:
+                answer_payload["interrupt_id"] = interrupt_id
+                answer_payload["interrupt_seq"] = intr.seq
+                answer_payload["answer_fingerprint"] = rv["answer_fingerprint"]
+
+        session.add(
+            ReviewApprovalModel(
+                id=str(uuid.uuid4()),
+                review_id=review.id,
+                decision=decision,
+                reviewer=rv["reviewer"],
+                comment=rv["comment"],
+                merge_baseline=rv["merge_baseline"],
+            )
+        )
+        review.status = "APPROVED" if decision == "APPROVE" else "REJECTED"
+        return Outcome(
+            shared={
+                "gate_result": {
+                    "decision": decision,
+                    "reviewer": rv["reviewer"],
+                    "comment": rv["comment"],
+                    "merge_baseline": rv["merge_baseline"],
+                }
+            },
+            events=[(answer_kind, "release_approval_gate", answer_payload)],
+            when=edge_when,
+        )
+
+    Scheduler(CHANGE_REVIEW_PLAN, {"release_approval_gate": _gate_resume_body}).resume(
+        ctx,
+        resume_value={
+            "decision": decision,
+            "reviewer": reviewer,
+            "comment": comment,
+            "merge_baseline": effective_merge,
+            "interrupt_evt": interrupt_evt,
+            "answer_fingerprint": fp,
+        },
+        resume_nodes=["release_approval_gate"],
+        record_event=False,
+    )
+    session.refresh(review)
+    out = serialize_review(review)
+    out["idempotent_replay"] = False
+    return out
+
+
 def approve_change_review(
     session: Session,
     review_id: str,
@@ -182,65 +297,14 @@ def approve_change_review(
     merge_baseline: bool = True,
 ) -> Dict[str, Any]:
     """Approve release gate idempotently via Interrupt protocol and optionally merge candidate into project baseline."""
-    review = session.get(ChangeReviewModel, review_id)
-    if review is None:
-        raise ValueError(f"未找到变更评估单: {review_id}")
-    if review.status == "REJECTED":
-        raise ValueError("该变更单已被驳回，禁止重复批准")
-
-    run = session.get(RunModel, review.run_id)
-    if run is None:
-        raise ValueError(f"未找到关联 Run: {review.run_id}")
-
-    fp = _decision_fingerprint("APPROVE", reviewer, comment, merge_baseline)
-    mode, pending_evt = answer_interrupt(
+    return _decide_change_review(
         session,
-        run,
-        "RELEASE_APPROVAL_REQUIRED",
-        "RELEASE_APPROVED",
-        fp,
-        answer_kinds=_APPROVAL_ANSWER_KINDS,
-        reject_conflict=True,
+        review_id,
+        decision="APPROVE",
+        reviewer=reviewer,
+        comment=comment,
+        merge_baseline=merge_baseline,
     )
-    if mode == "REPLAY":
-        out = serialize_review(review)
-        out["idempotent_replay"] = True
-        return out
-
-    interrupt_evt = pending_evt or latest_interrupt(session, run, "RELEASE_APPROVAL_REQUIRED")
-    record_interrupt_answer(
-        session,
-        run,
-        "RELEASE_APPROVED",
-        "release_approval_gate",
-        {
-            "decision": "APPROVE",
-            "reviewer": reviewer,
-            "comment": comment,
-            "merge_baseline": merge_baseline,
-        },
-        interrupt=interrupt_evt,
-        answer_fingerprint=fp,
-    )
-    session.add(
-        ReviewApprovalModel(
-            id=str(uuid.uuid4()),
-            review_id=review.id,
-            decision="APPROVE",
-            reviewer=reviewer,
-            comment=comment,
-            merge_baseline=merge_baseline,
-        )
-    )
-    review.status = "APPROVED"
-    if merge_baseline and not review.merged_to_baseline:
-        _merge_review_to_baseline(session, review, author=reviewer)
-        review.merged_to_baseline = True
-    session.commit()
-    session.refresh(review)
-    out = serialize_review(review)
-    out["idempotent_replay"] = False
-    return out
 
 
 def reject_change_review(
@@ -251,62 +315,14 @@ def reject_change_review(
     comment: str = "",
 ) -> Dict[str, Any]:
     """Reject release gate idempotently without altering project baseline."""
-    review = session.get(ChangeReviewModel, review_id)
-    if review is None:
-        raise ValueError(f"未找到变更评估单: {review_id}")
-    if review.status == "APPROVED":
-        raise ValueError("该变更单已批准合并基线，不可驳回")
-
-    run = session.get(RunModel, review.run_id)
-    if run is None:
-        raise ValueError(f"未找到关联 Run: {review.run_id}")
-
-    fp = _decision_fingerprint("REJECT", reviewer, comment, False)
-    mode, pending_evt = answer_interrupt(
+    return _decide_change_review(
         session,
-        run,
-        "RELEASE_APPROVAL_REQUIRED",
-        "RELEASE_REJECTED",
-        fp,
-        answer_kinds=_REJECT_ANSWER_KINDS,
-        reject_conflict=True,
+        review_id,
+        decision="REJECT",
+        reviewer=reviewer,
+        comment=comment,
+        merge_baseline=False,
     )
-    if mode == "REPLAY":
-        out = serialize_review(review)
-        out["idempotent_replay"] = True
-        return out
-
-    interrupt_evt = pending_evt or latest_interrupt(session, run, "RELEASE_APPROVAL_REQUIRED")
-    record_interrupt_answer(
-        session,
-        run,
-        "RELEASE_REJECTED",
-        "release_approval_gate",
-        {
-            "decision": "REJECT",
-            "reviewer": reviewer,
-            "comment": comment,
-            "merge_baseline": False,
-        },
-        interrupt=interrupt_evt,
-        answer_fingerprint=fp,
-    )
-    session.add(
-        ReviewApprovalModel(
-            id=str(uuid.uuid4()),
-            review_id=review.id,
-            decision="REJECT",
-            reviewer=reviewer,
-            comment=comment,
-            merge_baseline=False,
-        )
-    )
-    review.status = "REJECTED"
-    session.commit()
-    session.refresh(review)
-    out = serialize_review(review)
-    out["idempotent_replay"] = False
-    return out
 
 
 def list_change_reviews(session: Session, project_id: str) -> List[Dict[str, Any]]:
@@ -355,7 +371,8 @@ def get_review_run_trace(session: Session, run_id: str) -> Optional[Dict[str, An
         .all()
     )
     chain_ok = verify_chain(session, run)
-    trace = build_trace(events)
+    plan = CHANGE_REVIEW_PLAN if str(run.spec_id or "").startswith("review:") else PROJECT_ANALYSIS_PLAN
+    trace = build_trace(events, run_id=run.id, plan=plan)
     return {
         "run_id": run.id,
         "spec_id": run.spec_id,

@@ -1,4 +1,4 @@
-"""Project-wide analysis orchestrator: full offline rule sweep + guarded AI refactoring roadmap."""
+"""Project-wide analysis orchestrator: full offline rule sweep + guarded AI refactoring roadmap via Scheduler."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.analysis.core import evaluate_project_rules, evaluate_script_rules
 from app.catalog import rebuild_project_lineage, serialize_script
-from app.infra.config import get_budget, get_effective_settings
+from app.infra.config import get_budget, get_effective_settings, get_settings
 from app.infra.db_tables import (
     OptimizationFindingModel,
     ScriptChunkModel,
@@ -20,8 +20,13 @@ from app.infra.db_tables import (
 )
 from app.infra.errors import ProviderAuthOrBillingError
 from app.infra.llm import RealDesignLlm, call_llm_validated, llm_execution_scope
-from app.kernel import append_event, create_run
-from app.policy import build_run_bus
+from app.kernel import Outcome, Scheduler, create_run
+from app.policy import (
+    PROJECT_ANALYSIS_PLAN,
+    build_analysis_context,
+    build_run_bus,
+    default_bus,
+)
 from .single_script_analyzer import replace_script_findings, sync_project_finding_count
 
 logger = logging.getLogger(__name__)
@@ -95,7 +100,7 @@ def analyze_project_wide(
     llm_client: Optional[Any] = None,
     max_chain_hops: int = 3,
 ) -> Dict[str, Any]:
-    """Run all 16 single-script rules + 6 project-wide rules on the entire repository, plus optional AI roadmap."""
+    """Run all 16 single-script rules + 6 project-wide rules via `PROJECT_ANALYSIS_PLAN`, plus optional AI roadmap."""
     project = session.get(ScriptProjectModel, project_id)
     if project is None:
         raise ValueError(f"未找到项目: {project_id}")
@@ -103,76 +108,122 @@ def analyze_project_wide(
     run = create_run(
         session,
         spec_id=f"project:{project.name}",
-        initial_node="static_scanner",
+        initial_node="created",
         initial_payload={"project_id": project_id, "run_llm": run_llm},
     )
 
-    topology = rebuild_project_lineage(session, project_id)
-
-    scripts = (
-        session.query(ScriptFileModel)
-        .filter(ScriptFileModel.project_id == project_id)
-        .order_by(ScriptFileModel.filename.asc())
-        .all()
-    )
-    all_chunks = (
-        session.query(ScriptChunkModel)
-        .filter(ScriptChunkModel.project_id == project_id)
-        .order_by(ScriptChunkModel.script_id.asc(), ScriptChunkModel.chunk_index.asc())
-        .all()
-    )
-    chunks_by_script: Dict[str, List[Dict[str, Any]]] = {}
-    for c in all_chunks:
-        chunks_by_script.setdefault(c.script_id, []).append(
-            {
-                "id": c.id,
-                "chunk_index": c.chunk_index,
-                "start_line": c.start_line,
-                "end_line": c.end_line,
-                "statement_kind": c.statement_kind,
-                "is_dynamic_sql": c.is_dynamic_sql,
-                "control_context": c.control_context,
-                "target_tables": c.target_tables_json or [],
-                "source_tables": c.source_tables_json or [],
-                "ast_features": c.ast_features_json or {},
-                "ast_fingerprint": c.ast_fingerprint,
-                "raw_sql": c.raw_sql,
-            }
-        )
-
-    script_finding_total = 0
-    for s in scripts:
-        s_dict = serialize_script(s)
-        s_chunks = chunks_by_script.get(s.id, [])
-        drafts = evaluate_script_rules(s_dict, s_chunks)
-        rows = replace_script_findings(session, project_id=project_id, script_id=s.id, drafts=drafts)
-        script_finding_total += len(rows)
-
-    project_drafts = evaluate_project_rules(topology, max_chain_hops=max_chain_hops)
-    project_rows = _replace_project_scope_findings(session, project_id=project_id, drafts=project_drafts)
-    total_findings = sync_project_finding_count(session, project_id)
-
-    append_event(
+    settings = get_effective_settings(session) if run_llm else get_settings()
+    budget = get_budget(session) if run_llm else None
+    run_bus = build_run_bus(budget=budget, run_id=run.id) if run_llm else default_bus()
+    active_llm = (llm_client or RealDesignLlm(settings)) if run_llm else None
+    ctx = build_analysis_context(
         session,
         run,
-        "STATIC_SCANNED",
-        "static_scanner",
-        {
-            "script_findings": script_finding_total,
-            "project_findings": len(project_rows),
-            "total_findings": total_findings,
-        },
+        settings=settings,
+        llm=active_llm,
+        budget=budget,
+        bus=run_bus,
     )
-    session.commit()
 
-    ai_status = "SKIPPED"
-    ai_roadmap: Dict[str, Any] = {}
+    state_out: Dict[str, Any] = {
+        "script_findings": 0,
+        "project_findings": 0,
+        "total_findings": 0,
+        "ai_status": "SKIPPED",
+        "ai_roadmap": {},
+    }
 
-    if run_llm:
-        budget = get_budget(session)
-        llm = llm_client or RealDesignLlm(get_effective_settings(session))
-        run_bus = build_run_bus(budget=budget, run_id=run.id)
+    def _static_scan(_inp: Any, _node_ctx: Any) -> Outcome:
+        topology = rebuild_project_lineage(session, project_id)
 
+        scripts = (
+            session.query(ScriptFileModel)
+            .filter(ScriptFileModel.project_id == project_id)
+            .order_by(ScriptFileModel.filename.asc())
+            .all()
+        )
+        all_chunks = (
+            session.query(ScriptChunkModel)
+            .filter(ScriptChunkModel.project_id == project_id)
+            .order_by(ScriptChunkModel.script_id.asc(), ScriptChunkModel.chunk_index.asc())
+            .all()
+        )
+        chunks_by_script: Dict[str, List[Dict[str, Any]]] = {}
+        for c in all_chunks:
+            chunks_by_script.setdefault(c.script_id, []).append(
+                {
+                    "id": c.id,
+                    "chunk_index": c.chunk_index,
+                    "start_line": c.start_line,
+                    "end_line": c.end_line,
+                    "statement_kind": c.statement_kind,
+                    "is_dynamic_sql": c.is_dynamic_sql,
+                    "control_context": c.control_context,
+                    "target_tables": c.target_tables_json or [],
+                    "source_tables": c.source_tables_json or [],
+                    "ast_features": c.ast_features_json or {},
+                    "ast_fingerprint": c.ast_fingerprint,
+                    "raw_sql": c.raw_sql,
+                }
+            )
+
+        script_finding_total = 0
+        script_summary_items: List[Dict[str, Any]] = []
+        for s in scripts:
+            s_dict = serialize_script(s)
+            s_chunks = chunks_by_script.get(s.id, [])
+            drafts = evaluate_script_rules(s_dict, s_chunks)
+            rows = replace_script_findings(session, project_id=project_id, script_id=s.id, drafts=drafts)
+            script_finding_total += len(rows)
+            if rows:
+                script_summary_items.append({"script_id": s.id, "filename": s.filename, "count": len(rows)})
+
+        project_drafts = evaluate_project_rules(topology, max_chain_hops=max_chain_hops)
+        project_rows = _replace_project_scope_findings(session, project_id=project_id, drafts=project_drafts)
+        total_findings = sync_project_finding_count(session, project_id)
+
+        state_out["script_findings"] = script_finding_total
+        state_out["project_findings"] = len(project_rows)
+        state_out["total_findings"] = total_findings
+
+        return Outcome(
+            output={
+                "topology": topology,
+                "script_count": len(scripts),
+                "chunk_count": len(all_chunks),
+                "project_rows": project_rows,
+            },
+            shared={
+                "script_findings": script_summary_items,
+                "project_findings": [
+                    {
+                        "rule": r.rule_code,
+                        "severity": r.severity,
+                        "title": r.title,
+                        "tables": r.related_tables_json,
+                        "description": r.description,
+                    }
+                    for r in project_rows[:12]
+                ],
+            },
+            events=[
+                (
+                    "STATIC_SCANNED",
+                    "static_scan",
+                    {
+                        "script_findings": script_finding_total,
+                        "project_findings": len(project_rows),
+                        "total_findings": total_findings,
+                    },
+                )
+            ],
+            when="synthesize" if run_llm else "skip_ai",
+        )
+
+    def _project_synthesis(inp: Any, node_ctx: Any) -> Outcome:
+        scan_out = inp or {}
+        topology = scan_out.get("topology") or {}
+        project_rows = scan_out.get("project_rows") or []
         known_tables = sorted(
             {
                 t
@@ -184,9 +235,9 @@ def analyze_project_wide(
         )
 
         try:
-            with llm_execution_scope(bus=run_bus):
+            with llm_execution_scope(bus=node_ctx.bus):
                 roadmap, _ = call_llm_validated(
-                    llm,
+                    node_ctx.llm,
                     "synthesize_project_optimizations",
                     instruction=(
                         f"请立足 `{project.name}` 全项目视角，结合血缘拓扑、共享表冲突、长链路、核心枢纽表及脚本静态问题，"
@@ -194,8 +245,8 @@ def analyze_project_wide(
                     ),
                     payload={
                         "project_name": project.name,
-                        "script_count": len(scripts),
-                        "chunk_count": len(all_chunks),
+                        "script_count": scan_out.get("script_count", 0),
+                        "chunk_count": scan_out.get("chunk_count", 0),
                         "allowed_tables": known_tables,
                         "topology_summary": {
                             "cycles": topology.get("cycles", []),
@@ -205,56 +256,88 @@ def analyze_project_wide(
                             "hub_tables": topology.get("hub_tables", [])[:8],
                             "duplicate_clusters_count": len(topology.get("duplicate_clusters", [])),
                         },
-                        "project_findings": [
-                            {
-                                "rule": r.rule_code,
-                                "severity": r.severity,
-                                "title": r.title,
-                                "tables": r.related_tables_json,
-                                "description": r.description,
-                            }
-                            for r in project_rows[:12]
-                        ],
+                        "project_findings": list(node_ctx.get("project_findings") or [])[:12],
                     },
-                    bus=run_bus,
+                    bus=node_ctx.bus,
                 )
-            ai_roadmap = roadmap
             summary = dict(project.summary_json or {})
             summary["ai_roadmap"] = roadmap
             project.summary_json = summary
             for pr in project_rows:
                 pr.ai_refined = True
-            session.commit()
-            append_event(
-                session,
-                run,
-                "PROJECT_SYNTHESIZED",
-                "project_synthesizer",
-                {
-                    "executive_summary": roadmap.get("executive_summary", ""),
-                    "recommendations_count": len(roadmap.get("architecture_recommendations", [])),
-                },
-                bus=run_bus,
+            state_out["ai_status"] = "COMPLETED"
+            state_out["ai_roadmap"] = roadmap
+            return Outcome(
+                shared={"ai_roadmap": roadmap},
+                events=[
+                    (
+                        "PROJECT_SYNTHESIZED",
+                        "project_synthesis",
+                        {
+                            "executive_summary": roadmap.get("executive_summary", ""),
+                            "recommendations_count": len(roadmap.get("architecture_recommendations", [])),
+                        },
+                    )
+                ],
+                when="always",
             )
-            session.commit()
-            ai_status = "COMPLETED"
         except ProviderAuthOrBillingError as exc:
-            ai_status = "BILLING_OR_AUTH_ERROR"
-            ai_roadmap = {"error": str(exc)}
+            state_out["ai_status"] = "BILLING_OR_AUTH_ERROR"
+            state_out["ai_roadmap"] = {"error": str(exc)}
             logger.warning("Project-wide AI synthesis aborted on auth/billing: %s", exc)
-        except Exception as exc:
-            ai_status = "FAILED_FALLBACK_OFFLINE"
-            ai_roadmap = {"error": str(exc)}
+            return Outcome(
+                events=[
+                    (
+                        "ANALYSIS_COMPLETED",
+                        "project_synthesis",
+                        {"ai_status": "BILLING_OR_AUTH_ERROR", "error": str(exc)},
+                    )
+                ],
+                when="always",
+            )
+        except Exception as exc:  # noqa: BLE001
+            state_out["ai_status"] = "FAILED_FALLBACK_OFFLINE"
+            state_out["ai_roadmap"] = {"error": str(exc)}
             logger.warning("Project-wide AI synthesis failed cleanly: %s", exc)
+            return Outcome(
+                events=[
+                    (
+                        "ANALYSIS_COMPLETED",
+                        "project_synthesis",
+                        {"ai_status": "FAILED_FALLBACK_OFFLINE", "error": str(exc)},
+                    )
+                ],
+                when="always",
+            )
+
+    def _completed(_inp: Any, _node_ctx: Any) -> Outcome:
+        return Outcome(
+            events=[
+                (
+                    "ANALYSIS_COMPLETED",
+                    "completed",
+                    {
+                        "ai_status": state_out["ai_status"],
+                        "total_findings": state_out["total_findings"],
+                    },
+                )
+            ],
+            when="always",
+        )
+
+    Scheduler(
+        PROJECT_ANALYSIS_PLAN,
+        {
+            "static_scan": _static_scan,
+            "project_synthesis": _project_synthesis,
+            "completed": _completed,
+        },
+    ).drive(ctx)
 
     return {
         "project_id": project_id,
         "run_id": run.id,
-        "script_findings": script_finding_total,
-        "project_findings": len(project_rows),
-        "total_findings": total_findings,
-        "ai_status": ai_status,
-        "ai_roadmap": ai_roadmap,
+        **state_out,
     }
 
 

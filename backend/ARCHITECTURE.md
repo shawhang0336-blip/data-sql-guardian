@@ -9,7 +9,7 @@ Layer 0: app.infra       （配置/日志/数据库12表/BlobStore/TaskRunner/�
    ▲
 Layer 1: app.kernel      （ProdAgent 六模块纯微内核：plan, bus, event_log, interrupt, run, scheduler）
    ▲
-Layer 2: app.policy      （领域蓝图 ds_plan、5大确定性事前门禁 adjudicators ds_bus、通道 ds_channels）
+Layer 2: app.policy      （领域蓝图 ds_plan、5大确定性事前门禁 adjudicators ds_bus、BSP 通道与上下文装配 ds_channels）
    ▲
 Layer 3: app.ingestion   （纯离线 parsers/：dialect_chunker, ast_analyzer, ddl_parser, archive_loader）
    ▲
@@ -28,7 +28,7 @@ Layer 8: app.main        （FastAPI 根装配与 lifespan 断点恢复）
 
 - **`app/` 根目录** 仅允许存在 `__init__.py`、`main.py` 与上述 8 个层级包。
 - **`app/kernel/`** 仅含 6 个内核模块，零任何业务层或策略层引用。
-- **`app/policy/`** 仅含 `ds_plan.py`、`ds_bus.py`、`ds_channels.py`，import 期零全局状态修改。
+- **`app/policy/`** 仅含 `ds_plan.py`、`ds_bus.py`、`ds_channels.py`，import 期零全局状态修改；`analysis/workflow/` 与 `review/` 统一通过 `Scheduler` + `PROJECT_ANALYSIS_PLAN` / `CHANGE_REVIEW_PLAN` + 对应 `Channels` / `Interrupt` 协议驱动。
 - **`app/ingestion/parsers/` 与 `app/analysis/core/`** 为纯离线内核，禁止出现 SQLAlchemy ORM、DB 会话或 LLM Client 依赖。
 - **`app/api/{domain}/`** 严格按四域划分，禁止路由互导。
 

@@ -23,16 +23,17 @@ from app.review import evaluate_script_change
 class _ScriptedFakeLlm:
     """Deterministic fake Tool-Call model exercising every schema & ds_bus path without external calls."""
 
-    def __init__(self, *, attempt_downgrade: bool = False):
+    def __init__(self, *, attempt_downgrade: bool = False, priority_limit: int = 1):
         self.calls = 0
         self.attempt_downgrade = attempt_downgrade
+        self.priority_limit = priority_limit
 
     def _build_args(self, tool_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if tool_name == "plan_script_review":
             allowed = payload.get("allowed_chunk_ids") or []
             return {
                 "script_purpose": "清理并加载账户汇总明细",
-                "priority_chunk_ids": allowed[:1],
+                "priority_chunk_ids": allowed[: self.priority_limit],
                 "review_focus": "关注 JOIN 函数包裹和 NULL 等值过滤",
             }
         if tool_name == "diagnose_chunk_issues":
@@ -197,7 +198,7 @@ END;"""
         )
         script = db.query(ScriptFileModel).filter(ScriptFileModel.project_id == proj.id).first()
 
-        fake_llm = _ScriptedFakeLlm(attempt_downgrade=False)
+        fake_llm = _ScriptedFakeLlm(attempt_downgrade=False, priority_limit=3)
         res_single = analyze_single_script(db, proj.id, script.id, run_llm=True, llm_client=fake_llm)
         assert res_single["ai_status"] == "COMPLETED"
         assert fake_llm.calls >= 2
@@ -211,7 +212,7 @@ END;"""
         assert res_proj["ai_status"] == "COMPLETED"
         assert res_proj["ai_roadmap"].get("executive_summary")
 
-        # Verify BLOCK floor protects against rogue downgrade model
+        # Verify BLOCK floor protects against rogue downgrade model and Scheduler logs BUS_REJECTED
         rogue_llm = _ScriptedFakeLlm(attempt_downgrade=True)
         rev = evaluate_script_change(
             db,
@@ -225,6 +226,63 @@ END;"""
         )
         assert rev["deterministic_verdict"] == "BLOCK"
         assert rev["final_verdict"] == "BLOCK"
+
+        from app.infra.db_tables import EventModel, RunModel
+        from app.policy import project
+
+        review_events = db.query(EventModel).filter(EventModel.run_id == rev["run_id"]).all()
+        assert any(e.kind == "BUS_REJECTED" for e in review_events)
+        assert project(db, db.get(RunModel, res_single["run_id"])).status == "COMPLETED"
+        assert project(db, db.get(RunModel, res_proj["run_id"])).status == "COMPLETED"
+
+
+def test_scheduler_bsp_multi_chunk_and_offline_project_run_completion(tmp_path: Path):
+    from app.infra.db_tables import EventModel, RunModel
+    from app.policy import project
+
+    Session = _new_test_session(tmp_path)
+    with Session() as db:
+        multi_sql = """CREATE OR REPLACE PROCEDURE SP_MULTI_OPT IS
+BEGIN
+  INSERT INTO TGT_A (ID) SELECT A.ID FROM SRC_A A INNER JOIN SRC_B B ON TRIM(A.ID) = B.ID;
+  INSERT INTO TGT_B SELECT * FROM SRC_C WHERE NAME LIKE '%TEST%';
+  UPDATE TGT_A SET FLAG = '1';
+  COMMIT;
+END;"""
+        proj = ingest_collected_scripts(
+            db,
+            name="BSP Multi Chunk",
+            source_mode="LOCAL_DIR",
+            source_path="/tmp/bsp",
+            dialect="oracle",
+            collected=[CollectedScript("SP_MULTI_OPT.sql", "SP_MULTI_OPT.sql", multi_sql, "multi123")],
+        )
+        script = db.query(ScriptFileModel).filter(ScriptFileModel.project_id == proj.id).first()
+
+        fake_llm = _ScriptedFakeLlm(attempt_downgrade=False, priority_limit=3)
+        res_single = analyze_single_script(
+            db,
+            proj.id,
+            script.id,
+            run_llm=True,
+            llm_client=fake_llm,
+            max_chunks_to_refine=3,
+        )
+        assert res_single["ai_status"] == "COMPLETED"
+        assert res_single["ai_notes"]["analyzed_chunks"] >= 2
+        single_run = db.get(RunModel, res_single["run_id"])
+        assert project(db, single_run).status == "COMPLETED"
+        single_kinds = [
+            e.kind for e in db.query(EventModel).filter(EventModel.run_id == single_run.id).order_by(EventModel.seq.asc()).all()
+        ]
+        assert "STATIC_SCANNED" in single_kinds
+        assert "CHUNK_ANALYZED" in single_kinds
+        assert single_kinds[-1] == "ANALYSIS_COMPLETED"
+
+        res_proj_offline = analyze_project_wide(db, proj.id, run_llm=False)
+        assert res_proj_offline["ai_status"] == "SKIPPED"
+        proj_run = db.get(RunModel, res_proj_offline["run_id"])
+        assert project(db, proj_run).status == "COMPLETED"
 
 
 def test_fastapi_4_domain_endpoints_e2e(tmp_path: Path):
