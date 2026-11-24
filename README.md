@@ -4,6 +4,18 @@
 
 面向金融与数仓 ETL SQL / Oracle PL-SQL 项目的**整仓切片解析、单脚本诊断重写、全局架构优化与上线前变更门禁**智能工程治理台。
 
+---
+
+## 工作台界面与三步主流程
+
+顶部横向三步工作台配合右上角项目切换器、`+ 导入项目` 弹窗、`系统设置`（`/settings`）与后端在线状态指示：
+
+1. **01 项目导入与血缘（`/`）**：主从分栏脚本浏览（GitHub 浅色代码视图，支持按语句切块与全文切换）、跨脚本血缘依赖边分页筛选（`DATA_FLOW` / `WRITE_CONFLICT` / `TRUNCATE_CONFLICT`）及 DDL 数据字典查阅。
+2. **02 单脚本 & 全局优化（`/analysis`）**：分页问题分诊清单（支持按严重级别、作用范围、处理状态与脚本过滤，及 `ADOPTED` / `IGNORED` 状态流转与重写代码对比）、单脚本分析视图，以及带阶段步进器、结构化摘要、编号改造步骤与可点击资产标签的 AI 架构重构路线图。
+3. **03 上线前变更门禁（`/review`）**：支持 `ADD` / `MODIFY` 变更提交，分栏查看多跳下游影响爆破半径（Blast Radius）、Unified Diff 代码对比、新增问题清单、门禁裁决（`PASS` / `WARN` / `BLOCK`）、人工审批合入基线、Markdown 报告导出与防篡改事件溯源链。
+
+---
+
 ## 核心能力
 
 1. **整仓导入与精确切块解析**
@@ -24,6 +36,40 @@
    - 确定性裁决红线：`PASS` / `WARN` / `BLOCK`（新增 P0、移除 `EXCEPTION`、新 `TRUNCATE`/写冲突或血缘环路强制 `BLOCK`），并挂载 `release_gate_floor_adjudicator` 禁止 AI 降级硬红线。
    - 通过 ProdAgent `Interrupt` 协议挂起等待人工审批；批准上线后自动合并入项目基线、`ScriptRevisionModel` 版本递增并重建全仓血缘；支持导出 Markdown 报告与查看防篡改 SHA-256 事件溯源链。
 
+---
+
+## 目录结构
+
+```text
+data-sql-guardian/
+├── backend/
+│   ├── app/
+│   │   ├── main.py                   # FastAPI 装配入口（lifespan / CORS / 路由注册）
+│   │   ├── infra/                    # 基础设施层：SQLite/ORM 表、BlobStore、受控 LLM 客户端与 Schema
+│   │   ├── kernel/                   # ProdAgent 微内核（Bus / EventLog / Interrupt / Plan / Run / Scheduler）
+│   │   ├── policy/                   # 治理门禁策略（ds_bus / ds_channels / ds_plan）
+│   │   ├── ingestion/                # ZIP/目录导入、方言切块（dialect_chunker）、DDL 与 AST 解析
+│   │   ├── catalog/                  # 项目基线服务、跨脚本血缘图（lineage_graph）与 Diff 引擎
+│   │   ├── analysis/                 # 确定性规则（script_rules / project_rules）与单脚本/全局分析工作流
+│   │   ├── review/                   # 变更评估与发布门禁（change_evaluator）
+│   │   └── api/                      # 四域薄路由与服务（workspace / analysis / review / platform）
+│   └── tests/                        # 17 项后端 pytest（AST 架构隔离 + SAC 语料 + 变更门禁 + E2E）
+├── frontend/
+│   ├── src/
+│   │   ├── app/                      # App.jsx（三步横向工作台壳层与路由）
+│   │   ├── api/                      # 统一 REST 客户端（client / workspace / analysis / review / platform）
+│   │   ├── components/               # 通用组件（CodeBlock / CodeDiffView / RoadmapView / ImportProjectModal 等）
+│   │   ├── context/                  # ProjectContext
+│   │   ├── hooks/                    # useAsync
+│   │   ├── features/                 # 四业务域页面（workspace / analysis / review / platform）
+│   │   ├── styles/index.css          # 工作台样式体系
+│   │   └── utils/labels.js           # 规则/状态映射与分页工具
+│   └── tests/                        # 5 项前端目录对称、API 隔离与工具审计测试
+└── README.md
+```
+
+---
+
 ## 四域 REST API 概览（`/api`）
 
 | 域 | 核心接口 | 说明 |
@@ -33,11 +79,15 @@
 | **Review** | `POST /api/projects/{id}/reviews`、`POST /api/reviews/{rid}/approve`、`reject`、`GET /api/reviews/{rid}/export`、`GET /api/runs/{id}/trace` | 变更评估、门禁审批合入基线、Markdown 导出与哈希链校验 |
 | **Platform** | `GET /api/system/health`、`dashboard`、`GET/PUT /api/settings`、`POST /api/settings/llm/test` | 健康检查、全局指标、脱敏 LLM 与 BudgetGuard 配置热更新 |
 
+---
+
 ## 实测验证基线（真实 SAC 语料）
 
 - 导入 `25` 个 SAC Oracle SQL 脚本（16,274 行），精准切分 `1,651` 个语句切块与 `183` 张 DDL 数据表。
 - 剔除 DDL 定义噪声后提取 `173` 条跨脚本 ETL 依赖边（含 `8` 组真写冲突与 `32` 组 `TRUNCATE` 冲突），精准命中 `SP_SAC_ACCT_AMOUNT.sql` 的 `NULL` 谓词逻辑死锁（`S001`）、`REPLACE` 连接（`S006`）与重复写入同表（`S013`），以及 `SP_SAC_LARGE_BULU.sql` 的函数包裹 JOIN（`S006`）、`LIKE '%购汇%'`（`S008`）、`SYS_GUID()`（`S010`）与 `SYSDATE` 时段分支（`S015`）。
 - 全量测试通过：`17` 项后端 pytest（`-W error::sqlalchemy.exc.SAWarning` 零警告）+ `5` 项前端审计测试及生产构建。
+
+---
 
 ## 环境配置与快速启动
 
@@ -56,12 +106,14 @@ npm install
 npm run dev
 ```
 
+---
+
 ## 测试命令
 
 ```bash
-# 后端全量测试（8 层 DAG/纯度检查 + SAC 真实语料 + 变更门禁 + 四域 API E2E）
+# 后端全量测试（17 项：8 层 DAG/纯度检查 + SAC 真实语料 + 变更门禁 + 四域 API E2E）
 cd backend && pytest -v -W error::sqlalchemy.exc.SAWarning
 
-# 前端目录/API 隔离审计与生产构建
+# 前端目录/API 隔离审计与生产构建（5 项审计测试 + Vite 构建）
 cd frontend && npm test && npm run build
 ```
